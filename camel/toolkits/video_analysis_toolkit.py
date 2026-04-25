@@ -15,8 +15,10 @@
 import tempfile
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import ffmpeg
+import requests
 from PIL import Image
 from scenedetect import (  # type: ignore[import-untyped]
     SceneManager,
@@ -56,30 +58,125 @@ class VideoAnalysisToolkit(BaseToolkit):
         self.model = model
 
 
-    def ask_question_about_video(self, video_path: str, question: str) -> str:
-        r"""Ask a question about the video.
+    def ask_question_about_video(
+        self, video_path: str, question: str, sys_prompt: Optional[str] = None
+    ) -> str:
+        r"""Answers video questions with optional custom instructions.
 
         Args:
-            video_path (str): The path to the video file.
-            question (str): The question to ask about the video.
+            video_path (str): Local path or URL to a video file.
+            question (str): Query about the video content.
+            sys_prompt (Optional[str]): Custom system prompt for the analysis.
+                (default: :obj:`None`)
 
         Returns:
-            str: The answer to the question.
+            str: Detailed answer based on video understanding.
         """
-        if self.model is not None:
-            with open(video_path, "rb") as f:
-                video_bytes = f.read()
-            msg = BaseMessage.make_user_message(
-                role_name="user",
-                content=question,
-                video_bytes=video_bytes,
-            )
+        logger.info(
+            f"Calling video analysis toolkit with question: {question} "
+            f"and video path: {video_path}"
+        )
+        if self.model is None:
+            return self._ask_via_gemini(video_path, question)
+
+        default_content = """Answer questions about videos by:
+            1. Examining the sampled frames carefully
+            2. Reasoning across frames for temporal context
+            3. Transcribing on-screen text where relevant
+            4. Logical deduction from visual evidence"""
+
+        system_msg = BaseMessage.make_assistant_message(
+            role_name="Video QA Specialist",
+            content=sys_prompt if sys_prompt else default_content,
+        )
+
+        return self._analyze_video(
+            video_path=video_path,
+            prompt=question,
+            system_message=system_msg,
+        )
+
+    def _load_video_bytes(self, video_path: str) -> bytes:
+        r"""Loads a video from either local path or URL.
+
+        Args:
+            video_path (str): Local path or URL to video.
+
+        Returns:
+            bytes: Raw video file contents.
+
+        Raises:
+            ValueError: For invalid paths or unreadable files.
+            requests.exceptions.RequestException: For URL fetch failures.
+        """
+        parsed = urlparse(video_path)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        }
+
+        if parsed.scheme in ("http", "https"):
+            logger.debug(f"Fetching video from URL: {video_path}")
+            try:
+                response = requests.get(video_path, timeout=30, headers=headers)
+                response.raise_for_status()
+                return response.content
+            except requests.exceptions.RequestException as e:
+                logger.error(f"URL fetch failed: {e}")
+                raise
+        else:
+            logger.debug(f"Loading local video: {video_path}")
+            try:
+                with open(video_path, "rb") as f:
+                    return f.read()
+            except Exception as e:
+                logger.error(f"Video loading failed: {e}")
+                raise ValueError(f"Invalid video file: {e}")
+
+    def _analyze_video(
+        self,
+        video_path: str,
+        prompt: str,
+        system_message: BaseMessage,
+    ) -> str:
+        r"""Core analysis method handling video loading and processing.
+
+        Args:
+            video_path (str): Video location.
+            prompt (str): Analysis query/instructions.
+            system_message (BaseMessage): Custom system prompt for the
+                analysis.
+
+        Returns:
+            str: Analysis result or error message.
+        """
+        try:
+            video_bytes = self._load_video_bytes(video_path)
+            logger.info(f"Analyzing video: {video_path}")
+
             agent = ChatAgent(
-                "You analyze videos and answer questions about them based on the frames provided.",
+                system_message=system_message,
                 model=self.model,
             )
-            return str(agent.step(msg).msg.content)
 
+            user_msg = BaseMessage.make_user_message(
+                role_name="User",
+                content=prompt,
+                video_bytes=video_bytes,
+            )
+
+            response = agent.step(user_msg)
+            agent.reset()
+            return response.msgs[0].content
+
+        except (ValueError, requests.exceptions.RequestException) as e:
+            logger.error(f"Video handling error: {e}")
+            return f"Video error: {e!s}"
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return f"Analysis failed: {e!s}"
+
+    def _ask_via_gemini(self, video_path: str, question: str) -> str:
+        r"""Fallback path: Google Gemini video understanding (paid)."""
         os.environ["GOOGLE_API_KEY"] = os.getenv('GOOGLE_API_KEY')
 
         import pathlib
