@@ -37,18 +37,80 @@ class AudioAnalysisToolkit(BaseToolkit):
     This class provides methods for processing and understanding audio data.
     """
 
-    def __init__(self, cache_dir: Optional[str] = None, audio_reasoning_model: Optional[BaseModelBackend] = None):
-        self.cache_dir = 'tmp/'
-        if cache_dir:
-            self.cache_dir = cache_dir
+    def __init__(
+        self,
+        cache_dir: Optional[str] = None,
+        audio_reasoning_model: Optional[BaseModelBackend] = None,
+        whisper_model_size: str = "large-v3",
+    ):
+        self.cache_dir = cache_dir or "tmp/"
+        os.makedirs(self.cache_dir, exist_ok=True)
 
-        self.client = openai.OpenAI()
         self.audio_reasoning_model = audio_reasoning_model
-        
-    def get_audio_duration(file_path):
+        self._whisper_model_size = whisper_model_size
+        self._whisper_model = None  # lazy: load only when transcribing
+        self._openai_client = None  # lazy: only used by the gpt-4o-audio fallback branch
+
+    @property
+    def client(self):
+        """Lazy OpenAI client. Only required by the (paid) gpt-4o-audio
+        fallback branch when no audio_reasoning_model is provided."""
+        if self._openai_client is None:
+            self._openai_client = openai.OpenAI()
+        return self._openai_client
+
+    def _get_whisper(self):
+        """Lazy-load a faster-whisper model on first use."""
+        if self._whisper_model is None:
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as e:
+                raise ImportError(
+                    "faster-whisper is required for local audio transcription. "
+                    "Install with: pip install faster-whisper"
+                ) from e
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+            compute_type = "float16" if device == "cuda" else "int8"
+            logger.info(
+                f"Loading faster-whisper {self._whisper_model_size} on {device} "
+                f"(compute_type={compute_type})..."
+            )
+            self._whisper_model = WhisperModel(
+                self._whisper_model_size,
+                device=device,
+                compute_type=compute_type,
+            )
+        return self._whisper_model
+
+    def _ensure_local_path(self, audio_path: str) -> str:
+        """Download URL audio to a temp file under cache_dir; return local path."""
+        parsed = urlparse(audio_path)
+        if not all([parsed.scheme, parsed.netloc]):
+            return audio_path
+        import tempfile
+        suffix = os.path.splitext(parsed.path)[1] or ".audio"
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=self.cache_dir)
+        os.close(fd)
+        res = requests.get(audio_path)
+        res.raise_for_status()
+        with open(tmp_path, "wb") as f:
+            f.write(res.content)
+        return tmp_path
+
+    def _transcribe_local(self, audio_path: str) -> str:
+        """Transcribe audio with faster-whisper (free, local)."""
+        model = self._get_whisper()
+        segments, _info = model.transcribe(audio_path, beam_size=5)
+        return " ".join(seg.text.strip() for seg in segments)
+
+    @staticmethod
+    def get_audio_duration(file_path: str) -> float:
         info = mediainfo(file_path)
-        duration = float(info['duration'])
-        return duration
+        return float(info['duration'])
 
 
     def ask_question_about_audio(self, audio_path: str, question: str) -> str:
@@ -68,32 +130,12 @@ class AudioAnalysisToolkit(BaseToolkit):
             `{audio_path}` and question `{question}`."
         )
 
-        parsed_url = urlparse(audio_path)
-        is_url = all([parsed_url.scheme, parsed_url.netloc])
-        encoded_string = None
-
-        if is_url:
-            res = requests.get(audio_path)
-            res.raise_for_status()
-            audio_data = res.content
-            encoded_string = base64.b64encode(audio_data).decode('utf-8')
-        else:
-            with open(audio_path, "rb") as audio_file:
-                audio_data = audio_file.read()
-            audio_file.close()
-            encoded_string = base64.b64encode(audio_data).decode('utf-8')
-
-        file_suffix = os.path.splitext(audio_path)[1]
-        file_format = file_suffix[1:]
+        # Normalize URL → local file once, then reuse for transcription / encoding / duration
+        local_audio_path = self._ensure_local_path(audio_path)
+        duration = self.get_audio_duration(local_audio_path)
 
         if self.audio_reasoning_model:
-            text_prompt = f"Transcribe all the content in the speech into text."
-            transcription = self.client.audio.transcriptions.create(
-                model="whisper-1",
-                file=open(audio_path, "rb")
-            )
-
-            transcript = transcription.text
+            transcript = self._transcribe_local(local_audio_path)
 
             reasoning_prompt = f"""
             <speech_transcription_result>{transcript}</speech_transcription_result>
@@ -101,12 +143,12 @@ class AudioAnalysisToolkit(BaseToolkit):
             Please answer the following question based on the speech transcription result above:
             <question>{question}</question>
             """
-            
+
             audio_reasoning_agent = ChatAgent(
                 "You are a helpful assistant that can answer questions about the given speech transcription.",
-                model=self.audio_reasoning_model
-                )
-            
+                model=self.audio_reasoning_model,
+            )
+
             reasoning_result = audio_reasoning_agent.step(reasoning_prompt)
             response: str = str(reasoning_result.msg.content)
             response += f"\n\nAudio duration: {duration} seconds"
@@ -116,6 +158,12 @@ class AudioAnalysisToolkit(BaseToolkit):
 
 
         else:
+            # ── Paid fallback: gpt-4o-mini-audio-preview ──
+            with open(local_audio_path, "rb") as f:
+                audio_data = f.read()
+            encoded_string = base64.b64encode(audio_data).decode("utf-8")
+            file_format = os.path.splitext(local_audio_path)[1][1:]
+
             text_prompt = f"""Answer the following question based on the given \
             audio information:\n\n{question}"""
 
@@ -143,9 +191,6 @@ class AudioAnalysisToolkit(BaseToolkit):
                     },
                 ],
             )  # type: ignore[misc]
-            
-            # get the duration of the audio
-            duration = self.get_audio_duration(audio_path)
 
             response: str = str(completion.choices[0].message.content)
             response += f"\n\nAudio duration: {duration} seconds"
