@@ -367,36 +367,35 @@ Query:
     @retry(RuntimeError, delay=60, backoff=2, max_delay=120)
     def _extract_webpage_content(self, url: str) -> str:
         api_key = os.getenv("FIRECRAWL_API_KEY")
-        from firecrawl import FirecrawlApp
 
-        # Initialize the FirecrawlApp with your API key
-        app = FirecrawlApp(api_key=api_key)
+        # Skip Firecrawl entirely without an API key — its constructor raises
+        # ValueError before reaching the try block, so the exception cannot be
+        # caught here. Go straight to the local html2text path.
+        if not api_key:
+            return self._extract_webpage_content_with_html2text(url)
 
         try:
+            from firecrawl import FirecrawlApp
+            app = FirecrawlApp(api_key=api_key)
             data = app.crawl_url(
                 url,
                 params={
-                'limit': 1,
-                'scrapeOptions': {'formats': ['markdown']}
-            }
-        )
-            
+                    'limit': 1,
+                    'scrapeOptions': {'formats': ['markdown']},
+                },
+            )
         except Exception as e:
-            if '403' in str(e):
-                logger.error(f"Error: {e}")
-                return e
-            elif "429" in str(e):
-                # too many requests
+            if "429" in str(e):
+                # too many requests — keep original retry behavior
                 logger.error(f"Error: {e}")
                 raise RuntimeError(f"Error: {e}")
-            
-            elif "Payment Required" in str(e):
-                logger.error(f"Error: {e}")
-                extracted_text = self._extract_webpage_content_with_html2text(url)
-                logger.debug(f"The extracted text from html2text is: {extracted_text}")
-                return extracted_text
-            else:
-                raise e
+            # any other failure (bad key / 401/402/403 / SDK API mismatch /
+            # network) falls back to local html2text
+            logger.warning(
+                f"Firecrawl failed ({type(e).__name__}: {e}); "
+                f"falling back to html2text."
+            )
+            return self._extract_webpage_content_with_html2text(url)
 
         logger.debug(f"Extracted data from {url} using firecrawl: {data}")
         if len(data['data']) == 0:
