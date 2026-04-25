@@ -45,44 +45,92 @@ import os
 
 
 class VideoAnalysisToolkit(BaseToolkit):
-    
-    
-    def __init__(self, download_directory: Optional[str] = None):
-        self.video_downloader_toolkit = VideoDownloaderToolkit(download_directory=download_directory)
-    
-    
+
+
+    def __init__(
+        self,
+        download_directory: Optional[str] = None,
+        vllm_url: Optional[str] = None,
+        vllm_api_key: str = "EMPTY",
+        vllm_model: Optional[str] = None,
+    ):
+        """
+        Args:
+            download_directory: Where to cache downloaded videos.
+            vllm_url: OpenAI-compatible vLLM endpoint serving a video-capable
+                VL model (e.g. Qwen2.5-VL, Qwen3-VL). When set, video questions
+                go to this endpoint instead of Gemini.
+            vllm_api_key: API key for the vLLM endpoint (typically "EMPTY").
+            vllm_model: Model name on the vLLM server. If None, auto-discovered
+                via /v1/models on first use.
+        """
+        self.video_downloader_toolkit = VideoDownloaderToolkit(
+            download_directory=download_directory
+        )
+        self.vllm_url = vllm_url
+        self.vllm_api_key = vllm_api_key
+        self._vllm_model = vllm_model
+        self._vllm_client = None  # lazy
+
+    def _get_vllm_client_and_model(self):
+        from openai import OpenAI
+        if self._vllm_client is None:
+            self._vllm_client = OpenAI(api_key=self.vllm_api_key, base_url=self.vllm_url)
+        if self._vllm_model is None:
+            self._vllm_model = self._vllm_client.models.list().data[0].id
+        return self._vllm_client, self._vllm_model
+
+    @staticmethod
+    def _to_video_url(video_path: str) -> str:
+        """Normalize a path/URL into something vLLM's video_url field accepts."""
+        if video_path.startswith(("http://", "https://", "file://", "data:")):
+            return video_path
+        return "file://" + os.path.abspath(video_path)
+
+    def _ask_via_vllm(self, video_path: str, question: str) -> str:
+        client, model = self._get_vllm_client_and_model()
+        video_url = self._to_video_url(video_path)
+        logger.debug(f"Video Q via vLLM ({model}): {video_url}")
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "video_url", "video_url": {"url": video_url}},
+                ],
+            }],
+        )
+        return response.choices[0].message.content
+
+    def _ask_via_gemini(self, video_path: str, question: str) -> str:
+        os.environ["GOOGLE_API_KEY"] = os.getenv('GOOGLE_API_KEY')
+        from google import genai
+        from google.genai import types
+        client = genai.Client()
+        response = client.models.generate_content(
+            model='models/gemini-2.0-flash',
+            contents=types.Content(parts=[
+                types.Part(text=question),
+                types.Part(file_data=types.FileData(file_uri=video_path)),
+            ]),
+        )
+        logger.debug(f"Video analysis response from gemini: {response.text}")
+        return response.text
+
     def ask_question_about_video(self, video_path: str, question: str) -> str:
         r"""Ask a question about the video.
-        
+
         Args:
-            video_path (str): The path to the video file.
+            video_path (str): The path or URL of the video file.
             question (str): The question to ask about the video.
 
         Returns:
             str: The answer to the question.
         """
-        os.environ["GOOGLE_API_KEY"] = os.getenv('GOOGLE_API_KEY')
-        
-        import pathlib
-        from google import genai
-        from google.genai import types
-        
-        client = genai.Client()
-
-        model = 'models/gemini-2.0-flash'
-
-        response = client.models.generate_content(
-            model=model,
-            contents=types.Content(
-                parts=[
-                    types.Part(text=question),
-                    types.Part(file_data=types.FileData(file_uri=video_path))
-                ]
-            )
-        )
-
-        logger.debug(f"Video analysis response from gemini: {response.text}")
-        return response.text
+        if self.vllm_url:
+            return self._ask_via_vllm(video_path, question)
+        return self._ask_via_gemini(video_path, question)
     
         
     def get_tools(self) -> List[FunctionTool]:
