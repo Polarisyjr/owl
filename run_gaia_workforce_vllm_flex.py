@@ -1,15 +1,14 @@
 """
 Flexible vLLM version of run_gaia_workforce.py.
 
-All 12 model call-sites in the GAIA workforce are routed through `make_model(role)`
-or `_resolve_endpoint(role)` (for tools that call vLLM directly):
+All 12 model call-sites in the GAIA workforce are routed through `make_model(role)`:
 
   Workforce orchestrators (3): coordinator, task, answerer
   Worker agents (3):           web, document, reasoning
   Toolkit-internal models (6): image, audio, browser_web, browser_planning,
-                               video (vLLM-served VL model — bypasses CAMEL
-                                      and calls OpenAI-compatible API directly
-                                      because CAMEL has no video message type),
+                               video (CAMEL extracts frames client-side via
+                                      BaseMessage.video_bytes, so any image-
+                                      capable VL model works),
                                and document (reused for DocumentProcessingToolkit's
                                              long-doc re-ranking inside
                                              _post_process_result)
@@ -173,16 +172,9 @@ def construct_agent_list() -> List[Dict[str, Any]]:
         text_processing_model=make_model("document"),
     )
     image_analysis_toolkit = ImageAnalysisToolkit(model=image_analysis_model)
-
-    # Video toolkit: bypass CAMEL, talk to vLLM's OpenAI-compatible API directly
-    # because CAMEL has no native video message type.
-    video_ep = _resolve_endpoint("video")
-    video_model_name = video_ep.model_type or _discover_model_name(video_ep.url, video_ep.api_key)
     video_analysis_toolkit = VideoAnalysisToolkit(
         download_directory="tmp/video",
-        vllm_url=video_ep.url,
-        vllm_api_key=video_ep.api_key,
-        vllm_model=video_model_name,
+        model=make_model("video"),
     )
     audio_analysis_toolkit = AudioAnalysisToolkit(
         cache_dir="tmp/audio", audio_reasoning_model=audio_reasoning_model,
