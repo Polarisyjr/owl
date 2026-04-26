@@ -42,12 +42,14 @@ class AudioAnalysisToolkit(BaseToolkit):
         cache_dir: Optional[str] = None,
         audio_reasoning_model: Optional[BaseModelBackend] = None,
         whisper_model_size: str = "large-v3",
+        whisper_device_index: Optional[int] = None,
     ):
         self.cache_dir = cache_dir or "tmp/"
         os.makedirs(self.cache_dir, exist_ok=True)
 
         self.audio_reasoning_model = audio_reasoning_model
         self._whisper_model_size = whisper_model_size
+        self._whisper_device_index = whisper_device_index  # None → faster-whisper default (cuda:0)
         self._whisper_model = None  # lazy: load only when transcribing
         self._openai_client = None  # lazy: only used by the gpt-4o-audio fallback branch
 
@@ -75,15 +77,14 @@ class AudioAnalysisToolkit(BaseToolkit):
             except ImportError:
                 device = "cpu"
             compute_type = "float16" if device == "cuda" else "int8"
+            kwargs = dict(device=device, compute_type=compute_type)
+            if self._whisper_device_index is not None:
+                kwargs["device_index"] = self._whisper_device_index
             logger.info(
                 f"Loading faster-whisper {self._whisper_model_size} on {device} "
-                f"(compute_type={compute_type})..."
+                f"(compute_type={compute_type}, device_index={self._whisper_device_index})..."
             )
-            self._whisper_model = WhisperModel(
-                self._whisper_model_size,
-                device=device,
-                compute_type=compute_type,
-            )
+            self._whisper_model = WhisperModel(self._whisper_model_size, **kwargs)
         return self._whisper_model
 
     def _ensure_local_path(self, audio_path: str) -> str:
