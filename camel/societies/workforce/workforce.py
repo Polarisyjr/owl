@@ -116,17 +116,17 @@ class Workforce(BaseNode):
         Returns:
             List[Task]: The subtasks.
         """
-        if len(task.failure_info) > 0:
+        if task.failure_info:
             failure_info_text = ""
-            for idx, failure_info in enumerate(task.failure_info):
-                failure_info_text += f"Attempt {idx+1}:\n"
-                failure_info_text += f"Information: {failure_info}\n"
-            
+            for idx, info in enumerate(task.failure_info):
+                failure_info_text += f"Attempt {idx + 1}:\n"
+                failure_info_text += f"Information: {info}\n"
+
             decompose_prompt = WF_TASK_REPLAN_PROMPT.format(
                 content=task.content,
                 child_nodes_info=self._get_child_nodes_info(),
                 additional_info=task.additional_info,
-                failure_info=task.failure_info
+                failure_info=failure_info_text,
             )
         else:
             decompose_prompt = WF_TASK_DECOMPOSE_PROMPT.format(
@@ -430,61 +430,59 @@ class Workforce(BaseNode):
     async def _handle_failed_task(self, task: Task) -> bool:
         if task.failure_count >= 3:
             return True
+        if self._task.failure_count >= 2:
+            return True
         task.failure_count += 1
 
-        # TODO: if task.failure_reason has content, then replanning, else retry
-        if len(task.failure_reason) > 0:
-            await self._replan_task(task)
-        
-        # TODO: REFINE IT LATER
+        # Remove the failed task from the channel
+        await self._channel.remove_task(task.id)
 
-        # # Remove the failed task from the channel
-        # await self._channel.remove_task(task.id)
-        # if task.get_depth() >= 3:
-        #     # Create a new worker node and reassign
-        #     assignee = self._create_worker_node_for_task(task)
-        #     await self._post_task(task, assignee.node_id)
-        # else:
-        #     subtasks = self._decompose_task(task)
-        #     # Insert packets at the head of the queue
-        #     self._pending_tasks.extendleft(reversed(subtasks))
-        #     await self._post_ready_tasks()
+        if task.failure_reason:
+            # Owl path: replan the whole task with the failure context
+            self._task.failure_count += 1
+            await self._replan_task(task)
+            await self._post_ready_tasks()
+        else:
+            # Upstream fallback (CAMEL 0.2.47): depth-based retry
+            if task.get_depth() >= 3:
+                assignee = self._create_worker_node_for_task(task)
+                await self._post_task(task, assignee.node_id)
+            else:
+                subtasks = self._decompose_task(task)
+                self._pending_tasks.extendleft(reversed(subtasks))
+                await self._post_ready_tasks()
         return False
     
 
     async def _replan_task(self, failed_task: Task) -> None:
-        from copy import deepcopy
-        logger.warning(f"Task {failed_task.id} has failed, replanning the whole task..")
+        logger.warning(
+            f"Subtask {failed_task.id} failed; replanning the overall task "
+            f"(replan #{self._task.failure_count})."
+        )
 
-        self._task.failure_info = f"""
-            In the previous attempt, when processing a subtask of the current task:
-            ```
-            {failed_task.content}
-            ```
-            the above task processing failed for the following reasons (responsed by an agent):
-            ```
-            {failed_task.failure_reason}
-            ```
-            When you make a new task division, you need to fully consider the above problems and make corrections.
-        """
-        overall_task = deepcopy(self._task)
-        logger.warning(f"Current failed count: {overall_task.failure_count}")
-        overall_task.subtasks = []
+        new_failure = (
+            f"In the previous attempt, when processing a subtask of the current task:\n"
+            f"```\n{failed_task.content}\n```\n"
+            f"the above task processing failed for the following reasons "
+            f"(responsed by an agent):\n"
+            f"```\n{failed_task.failure_reason}\n```\n"
+            f"When you make a new task division, you need to fully consider "
+            f"the above problems and make corrections."
+        )
+        self._task.failure_info.append(new_failure)
 
-        # self.reset()
-        self._task = overall_task
+        # Mutate self._task in place so the caller's Task reference stays
+        # consistent with what `process_task` returns.
+        self._task.subtasks = []
+        self._task.state = TaskState.FAILED
+
         self._pending_tasks.clear()
-        self._child_listening_tasks.clear()
         self.coordinator_agent.reset()
         self.task_agent.reset()
-        
-        self._task.state = TaskState.FAILED
-        self._pending_tasks.append(overall_task)
 
-        subtasks = self._decompose_task(overall_task)
+        self._pending_tasks.append(self._task)
+        subtasks = self._decompose_task(self._task)
         self._pending_tasks.extendleft(reversed(subtasks))
-        # self.set_channel(TaskChannel())
-        breakpoint()
 
 
     async def _handle_completed_task(self, task: Task) -> None:

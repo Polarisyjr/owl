@@ -16,7 +16,7 @@ import re
 from enum import Enum
 from typing import Callable, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from camel.agents import ChatAgent
 from camel.messages import BaseMessage
@@ -103,7 +103,11 @@ class Task(BaseModel):
     raw_history: List[dict] = []
     
     failure_reason: Optional[str] = None
-    
+
+    failure_count: int = 0
+
+    failure_info: List[str] = Field(default_factory=list)
+
     assignee: str = ""
     
     assignee_id: str = ""
