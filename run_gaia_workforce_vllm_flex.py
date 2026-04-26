@@ -20,10 +20,12 @@ ever see text — audio is transcribed by faster-whisper before reaching
 the LLM, documents are parsed to text by pdfminer/etc. So the cheapest
 split is 1 VL endpoint for {image, video, browser_web}.
 
-Endpoint config lives in `gaia_workforce.yaml` (next to this script) — each
-role gets a `port` and `gpus`. Roles sharing the same port point at the same
-vLLM server. A role with `port: null` is a non-vLLM tool (whisper); its
-`gpus[0]` becomes the base device_index for faster-whisper.
+Endpoint config lives in `gaia_workforce.yaml` (next to this script). Each
+role under `roles:` gets `{ port, gpus }`; roles sharing the same `port`
+point at the same vLLM server. The top-level `whisper_gpu: N` pins
+faster-whisper's shared instance to GPU N. `gpus` per role is informational
+(consumed by launch / profiling tooling); this script only reads `port`
+and auto-discovers the served model name via /v1/models.
 
   GAIA_WORKFORCE_CONFIG=/path/to/other.yaml  → use a different config
   VLLM_HOST=remote-host                      → endpoint host (default localhost)
@@ -31,14 +33,13 @@ vLLM server. A role with `port: null` is a non-vLLM tool (whisper); its
 """
 from __future__ import annotations
 
-import itertools
+import multiprocessing as mp
 import os
 import shutil
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -104,16 +105,16 @@ def _load_config(path: Path) -> Dict[str, Any]:
 _CONFIG = _load_config(_CONFIG_PATH)
 logger.info(f"[vLLM] loaded workforce config from {_CONFIG_PATH}")
 
-# Build VLLM_ENDPOINTS from the YAML `roles` table. Skip whisper (no port,
-# handled separately) and any role with port=null.
+# whisper GPU pin (top-level scalar; None → faster-whisper default cuda:0)
+_WHISPER_GPU_BASE: Optional[int] = _CONFIG.get("whisper_gpu")
+
+# Build VLLM_ENDPOINTS from the YAML `roles` table. The yaml's `gpu` and
+# `model` fields are informational (used by launch / profiling tooling, not
+# this script) — the flex script only needs `port` to construct the URL,
+# and auto-discovers the actual served model via /v1/models.
 VLLM_ENDPOINTS: Dict[str, VllmEndpoint] = {}
-_WHISPER_GPU_BASE: Optional[int] = None
 for _role_name, _role_cfg in (_CONFIG.get("roles") or {}).items():
     _port = _role_cfg.get("port")
-    _gpus = _role_cfg.get("gpus") or []
-    if _role_name == "whisper":
-        _WHISPER_GPU_BASE = _gpus[0] if _gpus else None
-        continue
     if _port is None:
         continue
     VLLM_ENDPOINTS[_role_name] = VllmEndpoint(
@@ -122,13 +123,14 @@ for _role_name, _role_cfg in (_CONFIG.get("roles") or {}).items():
         extra_config=_role_cfg.get("extra_config") or {},
     )
 
+# Safety net: if no `default` is listed, alias the first role so
+# _resolve_endpoint can always fall back for unknown role names.
 if "default" not in VLLM_ENDPOINTS:
     if not VLLM_ENDPOINTS:
         raise ValueError(
             f"No usable vLLM roles in {_CONFIG_PATH} (need at least one role "
             f"with a non-null `port`)."
         )
-    # alias the first listed role as `default` so _resolve_endpoint always works
     _first_role = next(iter(VLLM_ENDPOINTS))
     VLLM_ENDPOINTS["default"] = VLLM_ENDPOINTS[_first_role]
     logger.info(
@@ -174,49 +176,46 @@ def make_model(role: str, **extra_config):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#                              shared whisper model
-# ──────────────────────────────────────────────────────────────────────────────
-#
-# Each AudioAnalysisToolkit lazy-loads its own faster-whisper instance into
-# VRAM (~1.5GB for large-v3). With N concurrent workers that's N × 1.5GB.
-# We bypass the per-toolkit lazy load by injecting one process-wide shared
-# WhisperModel into every toolkit's `_whisper_model` attribute. CTranslate2
-# is thread-safe for inference, so concurrent transcribe() calls are fine.
-
-_shared_whisper = None
-_shared_whisper_lock = threading.Lock()
-
-
-def _get_shared_whisper():
-    """Lazy-init one WhisperModel and reuse across all AudioAnalysisToolkit
-    instances. Device pinned to roles.whisper.gpus[0] from YAML."""
-    global _shared_whisper
-    if _shared_whisper is not None:
-        return _shared_whisper
-    with _shared_whisper_lock:
-        if _shared_whisper is not None:
-            return _shared_whisper
-        from faster_whisper import WhisperModel
-        try:
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            device = "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
-        kwargs = dict(device=device, compute_type=compute_type)
-        if _WHISPER_GPU_BASE is not None:
-            kwargs["device_index"] = _WHISPER_GPU_BASE
-        logger.info(
-            f"[whisper] loading shared large-v3 on {device} "
-            f"(device_index={_WHISPER_GPU_BASE}, compute_type={compute_type})"
-        )
-        _shared_whisper = WhisperModel("large-v3", **kwargs)
-        return _shared_whisper
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 #                                workforce build
 # ──────────────────────────────────────────────────────────────────────────────
+#
+# Whisper memory policy:
+#   - lazy load: workers that never see an audio task never load whisper
+#   - release-after-each: after each transcribe(), the model is dropped and
+#     CTranslate2 actually returns the ~3.5GB to the OS (verified — unlike
+#     PyTorch's caching allocator, CTranslate2 frees on destruction).
+#     Costs ~2.6s reload per audio task but lets us run 64+ workers without
+#     blowing up the whisper GPU. See _patch_transcribe_release_after_each.
+
+
+def _patch_transcribe_release_after_each(toolkit) -> None:
+    """Wrap toolkit._transcribe_local so the WhisperModel is freed back to
+    the OS immediately after each transcription finishes. This caps the
+    instantaneous whisper VRAM at "number of workers actively transcribing
+    × 3.5GB" instead of "number of workers that have ever transcribed × 3.5GB".
+    """
+    import gc
+    orig = toolkit._transcribe_local
+
+    def _release():
+        if toolkit._whisper_model is not None:
+            del toolkit._whisper_model
+            toolkit._whisper_model = None
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+
+    def wrapped(audio_path):
+        try:
+            return orig(audio_path)
+        finally:
+            _release()
+
+    toolkit._transcribe_local = wrapped
 
 def construct_agent_list(worker_id: int = 0) -> List[Dict[str, Any]]:
     web_model                = make_model("web")
@@ -244,10 +243,9 @@ def construct_agent_list(worker_id: int = 0) -> List[Dict[str, Any]]:
     audio_analysis_toolkit = AudioAnalysisToolkit(
         cache_dir=f"{tmp_root}/audio",
         audio_reasoning_model=audio_reasoning_model,
+        whisper_device_index=_WHISPER_GPU_BASE,
     )
-    # Inject the shared whisper instance, bypassing the toolkit's per-instance
-    # lazy load. See `_get_shared_whisper` for details.
-    audio_analysis_toolkit._whisper_model = _get_shared_whisper()
+    _patch_transcribe_release_after_each(audio_analysis_toolkit)
     code_runner_toolkit = CodeExecutionToolkit(sandbox="subprocess", verbose=True)
     browser_simulator_toolkit = AsyncBrowserToolkit(
         headless=True,
@@ -362,26 +360,142 @@ def process_single_task(task_description: str, max_replanning_tries: int = 2) ->
     return workforce.get_workforce_final_answer(processed)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+#                            multi-process GAIA runner
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Each worker is its own Python process (mp_context='spawn' — fork is unsafe
+# once anything has touched CUDA in the parent). On startup `_proc_init`
+# constructs a Workforce and binds it to a process-global, so subsequent
+# tasks reuse it instead of paying the construction cost per-task.
+#
+# Result aggregation: workers `return` a result dict from `_proc_run_one`,
+# the main process picks it up via `as_completed` and appends to the
+# benchmark's `_results` (no IPC lock needed — only the main thread mutates).
+#
+# Memory lifecycle: every per-process global (workforce, agents, toolkits,
+# any lazily-loaded whisper) lives until the worker process exits. The
+# `with ProcessPoolExecutor(...)` context manager calls `shutdown(wait=True)`
+# on exit, which terminates each worker — and that is when CUDA buffers
+# (whisper weights, any cached allocator pool) are reclaimed by the OS.
+
+_proc_workforce: Optional[OwlGaiaWorkforce] = None
+_proc_benchmark: Optional[GAIABenchmark] = None
+_proc_worker_id: Optional[int] = None
+
+
+def _proc_init(data_dir: str, save_to: str) -> None:
+    """Per-worker-process initializer. Builds the Workforce once and stashes
+    it on a module global so every task this worker runs reuses it."""
+    global _proc_workforce, _proc_benchmark, _proc_worker_id
+    _proc_worker_id = os.getpid()
+    _proc_benchmark = GAIABenchmark(data_dir=data_dir, save_to=save_to)
+    # _proc_benchmark.load()
+    _proc_workforce = construct_workforce(worker_id=_proc_worker_id)
+    logger.info(f"[worker pid={_proc_worker_id}] initialized")
+
+
+def _proc_run_one(
+    task: Dict[str, Any],
+    max_tries: int,
+    max_replanning_tries: int,
+) -> Optional[Dict[str, Any]]:
+    """Run one GAIA task to completion (with retries) in this worker process.
+    Returns the result dict to send back to the main process, or None if the
+    task could not be prepared (e.g. missing input file)."""
+    assert _proc_workforce is not None and _proc_benchmark is not None
+    wf = _proc_workforce
+    bench = _proc_benchmark
+
+    success = False
+    tries = 0
+    trajectory_with_retry: List[dict] = []
+    final_result: Optional[Dict[str, Any]] = None
+
+    while not success and tries < max_tries:
+        tries += 1
+        logger.info(
+            f"Attempt {tries}/{max_tries} for task {task['task_id']} "
+            f"(worker pid={_proc_worker_id})"
+        )
+        try:
+            valid, error_msg = bench._prepare_task(task)
+            if not valid:
+                logger.error(error_msg)
+                break
+            logger.info(f"Task Question: {task['Question']}")
+            camel_task = bench._create_task(task)
+            if wf.is_running():
+                wf.stop()
+            processed_task = wf.process_task(
+                camel_task, max_replanning_tries=max_replanning_tries
+            )
+
+            try:
+                answer = wf.get_workforce_final_answer(processed_task)
+            except Exception as e:
+                logger.error(f"Error extracting final answer: {e}")
+                answer = None
+
+            logger.info(
+                f"Model answer: {answer}, Ground truth: {task['Final answer']}"
+            )
+            score = bench.question_scorer(answer, task["Final answer"])
+            logger.info(f"Score: {score}")
+            success = score == True
+            trajectory_with_retry.append({
+                "attempts": tries,
+                "model_answer": answer,
+                "ground_truth": task["Final answer"],
+                "success": success,
+                "trajectory": wf.get_overall_task_solve_trajectory(),
+            })
+
+            if success or tries == max_tries:
+                final_result = {
+                    "task_id": task["task_id"],
+                    "question": task["Question"],
+                    "level": task["Level"],
+                    "model_answer": answer,
+                    "ground_truth": task["Final answer"],
+                    "score": score,
+                    "attempts": tries,
+                    "trajectory": trajectory_with_retry,
+                }
+        except Exception as e:
+            logger.error(f"Error in processing task (attempt {tries}): {e}")
+            if tries == max_tries:
+                final_result = {
+                    "task_id": task["task_id"],
+                    "question": task["Question"],
+                    "level": task["Level"],
+                    "model_answer": None,
+                    "ground_truth": task["Final answer"],
+                    "score": False,
+                    "attempts": tries,
+                    "trajectory": trajectory_with_retry,
+                }
+
+    return final_result
+
+
 def _run_gaia_parallel(
     benchmark: GAIABenchmark,
     on: str,
     level: int,
-    test_idx: Optional[List[int]],
     max_tries: int,
     max_replanning_tries: int,
     save_result: bool,
     max_workers: int,
+    subset: Optional[int] = None,
+    test_idx: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
-    """Parallel GAIA runner that orchestrates tasks itself instead of going
-    through `benchmark.run_workforce_with_retry`. Each worker thread owns
-    one Workforce (built via `construct_workforce(worker_id)`), and shared
-    benchmark state (`_results`, save file) is guarded by a lock.
-
-    Reuses GAIABenchmark helpers for non-concurrent bits: `_load_tasks`,
-    `_check_task_completed`, `_prepare_task`, `_create_task`, `question_scorer`,
-    `_save_results_to_file`, `_generate_summary`.
+    """Multi-process GAIA runner. Spawns N persistent worker processes via
+    ProcessPoolExecutor; each worker constructs its own Workforce in
+    `_proc_init` and reuses it across many tasks. The main process owns
+    `benchmark._results` and the save file, so no IPC lock is needed.
     """
-    tasks = benchmark._load_tasks(on, level, randomize=False, subset=None, idx=test_idx)
+    tasks = benchmark._load_tasks(on, level, randomize=False, subset=subset, idx=test_idx)
 
     benchmark._results = []
     if save_result:
@@ -397,111 +511,36 @@ def _run_gaia_parallel(
         else:
             pending.append(t)
 
-    results_lock = threading.Lock()
-    workforces: Dict[int, OwlGaiaWorkforce] = {}
-    workforces_lock = threading.Lock()
-    thread_local = threading.local()
-    worker_counter = itertools.count()
+    if not pending:
+        return benchmark._generate_summary()
 
-    def get_workforce_for_thread() -> Tuple[int, OwlGaiaWorkforce]:
-        wid = getattr(thread_local, "worker_id", None)
-        if wid is None:
-            wid = next(worker_counter) % max(max_workers, 1)
-            thread_local.worker_id = wid
-        with workforces_lock:
-            wf = workforces.get(wid)
-            if wf is None:
-                wf = construct_workforce(worker_id=wid)
-                workforces[wid] = wf
-        return wid, wf
-
-    def append_result(info: Dict[str, Any]) -> None:
-        with results_lock:
-            benchmark._results.append(info)
-            if save_result:
-                benchmark._save_results_to_file(benchmark._results, benchmark.save_to)
-
-    def run_one(task: Dict[str, Any]) -> None:
-        worker_id, wf = get_workforce_for_thread()
-        success = False
-        tries = 0
-        trajectory_with_retry: List[dict] = []
-
-        while not success and tries < max_tries:
-            tries += 1
-            logger.info(
-                f"Attempt {tries}/{max_tries} for task {task['task_id']} "
-                f"(worker {worker_id})"
-            )
-            try:
-                valid, error_msg = benchmark._prepare_task(task)
-                if not valid:
-                    logger.error(error_msg)
-                    break
-                logger.info(f"Task Question: {task['Question']}")
-                camel_task = benchmark._create_task(task)
-                if wf.is_running():
-                    wf.stop()
-                processed_task = wf.process_task(
-                    camel_task, max_replanning_tries=max_replanning_tries
-                )
-
-                try:
-                    answer = wf.get_workforce_final_answer(processed_task)
-                except Exception as e:
-                    logger.error(f"Error extracting final answer: {e}")
-                    answer = None
-
-                logger.info(
-                    f"Model answer: {answer}, Ground truth: {task['Final answer']}"
-                )
-                score = benchmark.question_scorer(answer, task["Final answer"])
-                logger.info(f"Score: {score}")
-                success = score == True
-                trajectory_with_retry.append({
-                    "attempts": tries,
-                    "model_answer": answer,
-                    "ground_truth": task["Final answer"],
-                    "success": success,
-                    "trajectory": wf.get_overall_task_solve_trajectory(),
-                })
-
-                if success or tries == max_tries:
-                    append_result({
-                        "task_id": task["task_id"],
-                        "question": task["Question"],
-                        "level": task["Level"],
-                        "model_answer": answer,
-                        "ground_truth": task["Final answer"],
-                        "score": score,
-                        "attempts": tries,
-                        "trajectory": trajectory_with_retry,
-                    })
-            except Exception as e:
-                logger.error(f"Error in processing task (attempt {tries}): {e}")
-                if tries == max_tries:
-                    append_result({
-                        "task_id": task["task_id"],
-                        "question": task["Question"],
-                        "level": task["Level"],
-                        "model_answer": None,
-                        "ground_truth": task["Final answer"],
-                        "score": False,
-                        "attempts": tries,
-                        "trajectory": trajectory_with_retry,
-                    })
-
+    ctx = mp.get_context("spawn")
     from tqdm import tqdm
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(run_one, t) for t in pending]
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=ctx,
+        initializer=_proc_init,
+        initargs=(str(benchmark.data_dir), benchmark.save_to),
+    ) as ex:
+        futures = [
+            ex.submit(_proc_run_one, t, max_tries, max_replanning_tries)
+            for t in pending
+        ]
         for fut in tqdm(
             as_completed(futures),
             total=len(futures),
             desc=f"Running {on} set (×{max_workers})",
         ):
-            exc = fut.exception()
-            if exc is not None:
-                logger.error(f"Worker raised unhandled exception: {exc}")
+            try:
+                result = fut.result()
+            except Exception as e:
+                logger.error(f"Worker raised unhandled exception: {e}")
+                continue
+            if result is None:
+                continue
+            benchmark._results.append(result)
+            if save_result:
+                benchmark._save_results_to_file(benchmark._results, benchmark.save_to)
 
     return benchmark._generate_summary()
 
@@ -509,7 +548,8 @@ def _run_gaia_parallel(
 def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
                      test_idx: Optional[List[int]] = None,
                      save_result: bool = True,
-                     max_workers: int = 1):
+                     max_workers: int = 1,
+                     subset: Optional[int] = None):
     """Full GAIA benchmark sweep.
 
     Args:
@@ -519,10 +559,10 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
             ``max_workers == 1`` falls back to the stock sequential
             ``benchmark.run_workforce_with_retry`` path (zero behavior change).
     """
-    if test_idx is None:
+    if test_idx is None and subset is None:
         test_idx = [1]
 
-    save_path = str(_RESULTS_DIR / "workforce" / f"workforce_{level}_pass{max_tries}_vllm.json")
+    save_path = str(_RESULTS_DIR / f"workforce_{level}_pass{max_tries}_vllm.json")
     if _TMP_DIR.exists():
         shutil.rmtree(_TMP_DIR)
 
@@ -535,6 +575,7 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
             on=on,
             level=level,
             idx=test_idx,
+            subset=subset,
             save_result=save_result,
             max_tries=max_tries,
             max_replanning_tries=2,
@@ -549,6 +590,7 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
             max_replanning_tries=2,
             save_result=save_result,
             max_workers=max_workers,
+            subset=subset,
         )
 
     logger.success(f"Correct: {result['correct']}, Total: {result['total']}")
@@ -560,13 +602,18 @@ if __name__ == "__main__":
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "single"
     if mode == "gaia":
-        # Optional CLI: `python run_gaia_workforce_vllm_flex.py gaia [max_workers]`
-        # Or via env: `GAIA_MAX_WORKERS=4 python ...`
+        # Optional CLI: `python run_gaia_workforce_vllm_flex.py gaia [max_workers] [subset]`
+        # Or via env: `GAIA_MAX_WORKERS=4 GAIA_SUBSET=20 python ...`
         if len(sys.argv) > 2 and sys.argv[2].isdigit():
             max_workers = int(sys.argv[2])
         else:
             max_workers = int(os.environ.get("GAIA_MAX_WORKERS", "1"))
-        evaluate_on_gaia(max_workers=max_workers)
+        if len(sys.argv) > 3 and sys.argv[3].isdigit():
+            subset = int(sys.argv[3])
+        else:
+            _env_subset = os.environ.get("GAIA_SUBSET")
+            subset = int(_env_subset) if _env_subset else None
+        evaluate_on_gaia(max_workers=max_workers, subset=subset)
     else:
         q = (
             " ".join(sys.argv[2:])

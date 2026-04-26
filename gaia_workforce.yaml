@@ -1,47 +1,42 @@
 name: gaia_workforce
 
-# role → port (vLLM /metrics) + gpus (nvidia-smi attribution).
-# port=null means non-LLM tool (whisper): GPU-side metrics only, no engine scrape.
+# Per-role vLLM endpoint + GPU assignment for the GAIA workforce.
+# Each role gets `port` and `gpus`. Roles sharing the same `port` point at
+# the same vLLM server (e.g. browser_planning piggybacks on web's endpoint).
+# Model name is auto-discovered from the server's /v1/models endpoint, so
+# it isn't listed here.
 #
-# Roles must use the exact names the workforce code calls `make_model(role)` with:
-#   text orchestrators : coordinator, task, answerer
-#   text worker agents : web, document, reasoning
-#   text toolkit-internal: audio, browser_planning
-#   VL toolkit-internal  : image, video, browser_web   (require a vision-capable model)
-#   non-vLLM             : whisper                     (faster-whisper, local STT)
-#
-# Roles sharing the same `port` (and therefore same `gpus`) point at the
-# same vLLM server — that's how you collapse e.g. image/video/browser_web
-# onto one VL endpoint, or a couple of text roles onto one text endpoint.
-# Any role NOT listed here falls back to `default`.
+# whisper is local faster-whisper (in-process), not a vLLM server — only
+# needs a GPU pin via the top-level `whisper_gpu` field.
 
 roles:
-  # ── text endpoints ────────────────────────────────────────────────────────
-  default:        { port: 8000, gpus: [0] }   # catch-all for unlisted text roles
-  coordinator:    { port: 8001, gpus: [1] }
-  task:           { port: 8002, gpus: [2] }
-  answerer:       { port: 8003, gpus: [3] }
-  web:            { port: 8004, gpus: [4] }
-  document:       { port: 8005, gpus: [5] }
-  reasoning:      { port: 8006, gpus: [6] }
-  # text sub-agents that piggyback on existing text endpoints
-  audio:            { port: 8004, gpus: [4] }   # share with web
-  browser_planning: { port: 8004, gpus: [4] }   # share with web
+  # Workforce orchestrators
+  coordinator:      { port: 8000, gpus: [0] }
+  task:             { port: 8001, gpus: [1] }
+  answerer:         { port: 8002, gpus: [2] }
 
-  # ── VL endpoint (image / video / browser_web all share one VL server) ────
-  image:          { port: 8007, gpus: [7] }
-  video:          { port: 8007, gpus: [7] }
-  browser_web:    { port: 8007, gpus: [7] }
+  # Primary worker agents
+  web:              { port: 8003, gpus: [3] }
+  document:         { port: 8004, gpus: [4] }
+  reasoning:        { port: 8005, gpus: [5] }
 
-  # ── non-vLLM: faster-whisper local STT ───────────────────────────────────
-  # The flex script reads gpus[0] and passes (gpus[0] + worker_id) to
-  # AudioAnalysisToolkit(whisper_device_index=...). Omit this entry to let
-  # faster-whisper use its default (cuda:0).
-  whisper:        { port: null, gpus: [7] }
+  # Toolkit-internal text sub-agents — share a primary text endpoint
+  browser_planning: { port: 8003, gpus: [3] }   # share with web
+  audio:            { port: 8004, gpus: [4] }   # share with document
+
+  # Multimodal endpoint — image / video / browser_web all share one VL server
+  browser_web:      { port: 8006, gpus: [6] }
+  image:            { port: 8006, gpus: [6] }
+  video:            { port: 8006, gpus: [6] }
+
+# Local faster-whisper STT — pinned GPU index. The flex script builds ONE
+# shared WhisperModel on this GPU and injects it into every
+# AudioAnalysisToolkit so all workers reuse the same instance. Omit to fall
+# back to faster-whisper's default (cuda:0).
+whisper_gpu: 7
 
 launch:
-  # Start vLLM servers separately (e.g. tmux script). Placeholder commands —
-  # adjust to your setup.
+  # Start vLLM servers separately (placeholder commands — adjust to your setup).
   start_cmd: "bash scripts/gaia/start_vllm.sh"
   stop_cmd: |
     for s in $(tmux ls 2>/dev/null | awk -F: '/^gaia-/ {print $1}'); do

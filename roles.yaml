@@ -1,0 +1,26 @@
+# Per-role vLLM endpoint + GPU assignment for the GAIA workforce.
+# Each role gets its own port and GPU. whisper is not a vLLM server —
+# faster-whisper runs in-process and just needs a GPU index.
+
+roles:
+  # Workforce orchestrators
+  coordinator:      { port: 8000, gpu: 0, model: Qwen3-8B }
+  task:             { port: 8001, gpu: 1, model: Qwen3-8B }
+  answerer:         { port: 8002, gpu: 2, model: Qwen3-8B }
+
+  # Primary worker agents
+  web:              { port: 8003, gpu: 3, model: Qwen3-8B }
+  document:         { port: 8004, gpu: 4, model: Qwen3-8B }
+  reasoning:        { port: 8005, gpu: 5, model: Qwen3-8B }
+
+  # Sub-agents inside worker toolkits
+  browser_planning: { port: 8003, gpu: 3, model: Qwen3-8B }
+  audio:            { port: 8004, gpu: 4, model: Qwen3-8B }
+
+  # multimodal
+  browser_web:      { port: 8006, gpu: 6, model: Qwen2.5-VL-7B }
+  image:            { port: 8006, gpu: 6, model: Qwen2.5-VL-7B }
+  video:            { port: 8006, gpu: 6, model: Qwen2.5-VL-7B }
+
+# Local faster-whisper (no port, just a GPU pin — used as WHISPER_GPU)
+whisper_gpu: 7
