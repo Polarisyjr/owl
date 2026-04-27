@@ -72,7 +72,7 @@ ffmpeg-python>=0.2.0
 # Optional dependencies - Web and API tools
 wikipedia>=1.0.0
 linkup-sdk>=0.2.1
-duckduckgo-search>=6.3.5
+ddgs>=9.0.0
 newspaper3k>=0.2.8
 wolframalpha>=5.0.0
 pyowm>=3.3.0

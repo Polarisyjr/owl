@@ -75,12 +75,17 @@ logger = logging.getLogger(__name__)
 
 
 def _proxy_on():
-    os.environ["http_proxy"] = "http://star-proxy.oa.com:3128"
-    os.environ["https_proxy"] = "http://star-proxy.oa.com:3128"
-    
+    # Tencent-internal star-proxy. Off by default — outside the corp network
+    # this host is unreachable and every tool call would 60s-timeout.
+    # Re-enable by exporting OWL_USE_PROXY=1.
+    if os.environ.get("OWL_USE_PROXY") == "1":
+        os.environ["http_proxy"] = "http://star-proxy.oa.com:3128"
+        os.environ["https_proxy"] = "http://star-proxy.oa.com:3128"
+
 def _proxy_off():
-    os.environ["http_proxy"] = ""
-    os.environ["https_proxy"] = ""
+    if os.environ.get("OWL_USE_PROXY") == "1":
+        os.environ["http_proxy"] = ""
+        os.environ["https_proxy"] = ""
 
 
 class OwlChatAgent(ChatAgent):

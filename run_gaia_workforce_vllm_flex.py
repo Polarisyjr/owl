@@ -47,7 +47,6 @@ from loguru import logger
 from openai import OpenAI
 
 from camel.models import ModelFactory
-from camel.tasks import Task
 from camel.toolkits import (
     AsyncBrowserToolkit,
     AudioAnalysisToolkit,
@@ -59,6 +58,7 @@ from camel.toolkits import (
     SearchToolkit,
     VideoAnalysisToolkit,
 )
+from camel.tasks import Task
 from camel.types import ModelPlatformType
 
 from utils import OwlGaiaWorkforce, OwlWorkforceChatAgent
@@ -160,6 +160,15 @@ def _resolve_endpoint(role: str) -> VllmEndpoint:
     return VLLM_ENDPOINTS["default"]
 
 
+_GLOBAL_TOKEN_LIMIT: Optional[int] = _CONFIG.get("token_limit")
+
+
+def _resolve_token_limit(role: str) -> Optional[int]:
+    """Per-role override > global > None (camel falls back to model.token_limit)."""
+    role_cfg = (_CONFIG.get("roles") or {}).get(role) or {}
+    return role_cfg.get("token_limit") or _GLOBAL_TOKEN_LIMIT
+
+
 def make_model(role: str, **extra_config):
     """Build a vLLM-backed CAMEL model for the given role."""
     ep = _resolve_endpoint(role)
@@ -233,6 +242,7 @@ def construct_agent_list(worker_id: int = 0) -> List[Dict[str, Any]]:
     search_toolkit = SearchToolkit()
     document_processing_toolkit = DocumentProcessingToolkit(
         cache_dir=tmp_root,
+        image_analysis_model=image_analysis_model,
         text_processing_model=make_model("document"),
     )
     image_analysis_toolkit = ImageAnalysisToolkit(model=image_analysis_model)
@@ -276,6 +286,7 @@ Here are some tips that help you perform web search:
 - The results you return do not have to directly answer the original question, you only need to collect relevant information.
 """,
         model=web_model,
+        token_limit=_resolve_token_limit("web"),
         tools=[
             FunctionTool(search_toolkit.search_duckduckgo),
             FunctionTool(search_toolkit.search_wiki),
@@ -290,6 +301,7 @@ Here are some tips that help you perform web search:
     document_processing_agent = OwlWorkforceChatAgent(
         "You are a helpful assistant that can process documents and multimodal data, such as images, audio, and video.",
         document_processing_model,
+        token_limit=_resolve_token_limit("document"),
         tools=[
             FunctionTool(document_processing_toolkit.extract_document_content),
             FunctionTool(image_analysis_toolkit.ask_question_about_image),
@@ -302,6 +314,7 @@ Here are some tips that help you perform web search:
     reasoning_coding_agent = OwlWorkforceChatAgent(
         "You are a helpful assistant that specializes in reasoning and coding, and can think step by step to solve the task. When necessary, you can write python code to solve the task. If you have written code, do not forget to execute the code. Never generate codes like 'example code', your code should be able to fully solve the task. You can also leverage multiple libraries, such as requests, BeautifulSoup, re, pandas, etc, to solve the task. For processing excel files, you should write codes to process them.",
         reasoning_model,
+        token_limit=_resolve_token_limit("reasoning"),
         tools=[
             FunctionTool(code_runner_toolkit.execute_code),
             FunctionTool(excel_toolkit.extract_excel_content),
@@ -329,9 +342,12 @@ Here are some tips that help you perform web search:
 
 
 def construct_workforce(worker_id: int = 0) -> OwlGaiaWorkforce:
-    coordinator_agent_kwargs = {"model": make_model("coordinator")}
-    task_agent_kwargs        = {"model": make_model("task")}
-    answerer_agent_kwargs    = {"model": make_model("answerer")}
+    coordinator_agent_kwargs = {"model": make_model("coordinator"),
+                                "token_limit": _resolve_token_limit("coordinator")}
+    task_agent_kwargs        = {"model": make_model("task"),
+                                "token_limit": _resolve_token_limit("task")}
+    answerer_agent_kwargs    = {"model": make_model("answerer"),
+                                "token_limit": _resolve_token_limit("answerer")}
 
     workforce = OwlGaiaWorkforce(
         f"Gaia Workforce {worker_id}",
@@ -549,7 +565,8 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
                      test_idx: Optional[List[int]] = None,
                      save_result: bool = True,
                      max_workers: int = 1,
-                     subset: Optional[int] = None):
+                     subset: Optional[int] = None,
+                     max_replanning_tries: int = 2):
     """Full GAIA benchmark sweep.
 
     Args:
@@ -578,7 +595,7 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
             subset=subset,
             save_result=save_result,
             max_tries=max_tries,
-            max_replanning_tries=2,
+            max_replanning_tries=max_replanning_tries,
         )
     else:
         result = _run_gaia_parallel(
@@ -587,7 +604,7 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
             level=level,
             test_idx=test_idx,
             max_tries=max_tries,
-            max_replanning_tries=2,
+            max_replanning_tries=max_replanning_tries,
             save_result=save_result,
             max_workers=max_workers,
             subset=subset,
@@ -602,8 +619,11 @@ if __name__ == "__main__":
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "single"
     if mode == "gaia":
-        # Optional CLI: `python run_gaia_workforce_vllm_flex.py gaia [max_workers] [subset]`
-        # Or via env: `GAIA_MAX_WORKERS=4 GAIA_SUBSET=20 python ...`
+        # CLI: `python run_gaia_workforce_vllm_flex.py gaia [max_workers] [subset]`
+        # Env knobs (override evaluate_on_gaia defaults):
+        #   GAIA_MAX_WORKERS, GAIA_SUBSET, GAIA_LEVEL (int or "all"),
+        #   GAIA_ON (valid|test), GAIA_MAX_TRIES, GAIA_MAX_REPLANNING_TRIES,
+        #   GAIA_TEST_IDX (comma list of ints, e.g. "0,5,12")
         if len(sys.argv) > 2 and sys.argv[2].isdigit():
             max_workers = int(sys.argv[2])
         else:
@@ -613,7 +633,26 @@ if __name__ == "__main__":
         else:
             _env_subset = os.environ.get("GAIA_SUBSET")
             subset = int(_env_subset) if _env_subset else None
-        evaluate_on_gaia(max_workers=max_workers, subset=subset)
+
+        kwargs: Dict[str, Any] = {}
+        if (_v := os.environ.get("GAIA_LEVEL")):
+            # int ("1"), list ("1,2"), or "all"
+            if "," in _v:
+                kwargs["level"] = [int(x) for x in _v.split(",") if x.strip()]
+            elif _v.isdigit():
+                kwargs["level"] = int(_v)
+            else:
+                kwargs["level"] = _v  # "all"
+        if (_v := os.environ.get("GAIA_ON")):
+            kwargs["on"] = _v
+        if (_v := os.environ.get("GAIA_MAX_TRIES")):
+            kwargs["max_tries"] = int(_v)
+        if (_v := os.environ.get("GAIA_MAX_REPLANNING_TRIES")):
+            kwargs["max_replanning_tries"] = int(_v)
+        if (_v := os.environ.get("GAIA_TEST_IDX")):
+            kwargs["test_idx"] = [int(x) for x in _v.split(",") if x.strip()]
+
+        evaluate_on_gaia(max_workers=max_workers, subset=subset, **kwargs)
     else:
         q = (
             " ".join(sys.argv[2:])

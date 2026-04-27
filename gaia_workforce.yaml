@@ -1,5 +1,10 @@
 name: gaia_workforce
 
+# Global ChatAgent.memory trim threshold. Should sit a few k below the
+# vLLM endpoint's max_model_len so vLLM has room to generate output
+# without hitting BadRequest. Per-role override goes under `roles.<role>.token_limit`.
+token_limit: 120000
+
 # Per-role vLLM endpoint + GPU assignment for the GAIA workforce.
 # Each role gets `port` and `gpus`. Roles sharing the same `port` point at
 # the same vLLM server (e.g. browser_planning piggybacks on web's endpoint).

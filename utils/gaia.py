@@ -93,35 +93,108 @@ class GAIABenchmark(BaseBenchmark):
     def load(self, force_download=False):
         r"""Load the GAIA dataset.
 
-        Args:
-            force_download (bool, optional): Whether to
-                force download the data.
-        """
-        if force_download:
-            logger.info("Force downloading data.")
-            self.download()
+        Resolution order (first hit wins):
+          1. ``GAIA_USE_CURATED=1`` env → curated file-less subset at
+             ``<owl_root>/tasks/level_{1,2,3}_tasks.json``.
+          2. Upstream HF parquet at ``{data_dir}/2023/{validation,test}/metadata.parquet``
+             (current HF format; 165 valid / 301 test, with file attachments).
+          3. Upstream HF jsonl at ``.../metadata.jsonl`` (legacy format).
+          4. Curated subset (final fallback).
+          5. Download from HF, then re-resolve.
 
-        # Define validation and test directories
+        Args:
+            force_download (bool, optional): Force a fresh HF download even
+                if local upstream data is present.
+        """
+        curated_root = Path(__file__).resolve().parent.parent / "tasks"
+        curated_files = {
+            1: curated_root / "level_1_tasks.json",
+            2: curated_root / "level_2_tasks.json",
+            3: curated_root / "level_3_tasks.json",
+        }
         valid_dir = self.data_dir / "2023/validation"
         test_dir = self.data_dir / "2023/test"
 
-        # Check if directories exist; if not, download the data
-        if not valid_dir.is_dir() or not test_dir.is_dir():
-            logger.info("Data not found. Downloading data.")
-            self.download()
-
-        # Load metadata for both validation and test datasets
-        for path, label in zip([valid_dir, test_dir], ["valid", "test"]):
+        def _read_parquet_split(path: Path, label: str) -> bool:
+            pq = path / "metadata.parquet"
+            if not pq.exists():
+                return False
+            import pandas as pd
+            df = pd.read_parquet(pq)
             self._data[label] = []
-            with open(path / "metadata.jsonl", "r") as f:
-                lines = f.readlines()
-                for line in lines:
+            for row in df.to_dict(orient="records"):
+                if row.get("task_id") == "0-0-0-0-0":
+                    continue
+                # Level is a string in parquet ('1'/'2'/'3'); cast to int so
+                # downstream `data["Level"] in [1,2,3]` filters work.
+                row["Level"] = int(row["Level"])
+                # Resolve relative `file_name` to absolute path under split dir.
+                if row.get("file_name"):
+                    row["file_name"] = path / row["file_name"]
+                else:
+                    row["file_name"] = ""
+                self._data[label].append(row)
+            return True
+
+        def _read_jsonl_split(path: Path, label: str) -> bool:
+            jl = path / "metadata.jsonl"
+            if not jl.exists():
+                return False
+            self._data[label] = []
+            with open(jl, "r") as f:
+                for line in f:
                     data = json.loads(line)
                     if data["task_id"] == "0-0-0-0-0":
                         continue
                     if data["file_name"]:
                         data["file_name"] = path / data["file_name"]
                     self._data[label].append(data)
+            return True
+
+        def _read_curated() -> bool:
+            if not all(p.exists() for p in curated_files.values()):
+                return False
+            logger.info(f"Loading curated GAIA tasks from {curated_root}")
+            self._data["valid"] = []
+            self._data["test"] = []  # curated subset has no test split
+            for p in curated_files.values():
+                with open(p, "r", encoding="utf-8") as f:
+                    tasks = json.load(f)
+                for t in tasks:
+                    if t.get("task_id") == "0-0-0-0-0":
+                        continue
+                    t.setdefault("file_name", "")
+                    self._data["valid"].append(t)
+            return True
+
+        if force_download:
+            logger.info("Force downloading data.")
+            self.download()
+
+        # 1. explicit curated override
+        if os.environ.get("GAIA_USE_CURATED") == "1":
+            if _read_curated():
+                return self
+            logger.warning("GAIA_USE_CURATED=1 but curated files missing; falling through.")
+
+        # 2-3. upstream parquet/jsonl per split
+        for path, label in [(valid_dir, "valid"), (test_dir, "test")]:
+            if not (_read_parquet_split(path, label) or _read_jsonl_split(path, label)):
+                self._data[label] = []  # empty split is OK; only one of valid/test may exist
+
+        if self._data.get("valid") or self._data.get("test"):
+            return self
+
+        # 4. curated fallback (no upstream data)
+        if _read_curated():
+            return self
+
+        # 5. last resort: download then retry parquet/jsonl
+        logger.info("Data not found. Downloading data.")
+        self.download()
+        for path, label in [(valid_dir, "valid"), (test_dir, "test")]:
+            if not (_read_parquet_split(path, label) or _read_jsonl_split(path, label)):
+                self._data[label] = []
         return self
     
     

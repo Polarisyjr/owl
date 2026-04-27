@@ -235,7 +235,7 @@ class SearchToolkit(BaseToolkit):
         except Exception as e:
             return {"error": f"An unexpected error occurred: {e!s}"}
 
-    @dependencies_required("duckduckgo_search")
+    @dependencies_required("ddgs")
     def search_duckduckgo(
         self, query: str, source: str = "text", max_results: int = 5
     ) -> List[Dict[str, Any]]:
@@ -256,7 +256,7 @@ class SearchToolkit(BaseToolkit):
             List[Dict[str, Any]]: A list of dictionaries where each dictionary
                 represents a search result.
         """
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         from requests.exceptions import RequestException
 
         ddgs = DDGS()
@@ -264,7 +264,7 @@ class SearchToolkit(BaseToolkit):
 
         if source == "text":
             try:
-                results = ddgs.text(keywords=query, max_results=max_results)
+                results = ddgs.text(query, max_results=max_results)
             except RequestException as e:
                 # Handle specific exceptions or general request exceptions
                 responses.append({"error": f"duckduckgo search failed.{e}"})
@@ -282,7 +282,7 @@ class SearchToolkit(BaseToolkit):
 
         elif source == "images":
             try:
-                results = ddgs.images(keywords=query, max_results=max_results)
+                results = ddgs.images(query, max_results=max_results)
             except RequestException as e:
                 # Handle specific exceptions or general request exceptions
                 responses.append({"error": f"duckduckgo search failed.{e}"})
@@ -301,7 +301,7 @@ class SearchToolkit(BaseToolkit):
 
         elif source == "videos":
             try:
-                results = ddgs.videos(keywords=query, max_results=max_results)
+                results = ddgs.videos(query, max_results=max_results)
             except RequestException as e:
                 # Handle specific exceptions or general request exceptions
                 responses.append({"error": f"duckduckgo search failed.{e}"})
