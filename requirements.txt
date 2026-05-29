@@ -29,7 +29,7 @@ mistralai>=1.1.0
 reka-api>=3.0.8
 anthropic>=0.42.0
 cohere>=5.11.0
-fish-audio-sdk>=2024.12.5
+# fish-audio-sdk>=2024.12.5
 
 # Optional dependencies - Huggingface ecosystem
 transformers>=4.0.0
@@ -97,8 +97,8 @@ praw>=7.7.1
 rouge>=1.0.1
 aiosqlite>=0.20.0
 textblob>=0.17.1
-datacommons>=1.4.3
-datacommons_pandas>=0.0.3
+# datacommons>=1.4.3
+# datacommons_pandas>=0.0.3
 pandas>=1.5.3
 stripe>=11.3.0
 networkx>=3.4.2
