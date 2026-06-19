@@ -60,7 +60,11 @@ class DocumentProcessingToolkit(BaseToolkit):
                 model_config_dict={"temperature": 0.0}
             )
     
-    @retry((requests.RequestException))
+    # No outer @retry here on purpose. The webpage fetchers and chunkr already
+    # retry internally (tries=3); wrapping this entrypoint in another retry
+    # nests (3×3 = 9 attempts) and could keep a stalling/anti-scrape URL wedged
+    # for minutes. `retry`'s default tries=-1 (infinite) made it even worse.
+    # Let inner failures surface to the agent directly.
     def extract_document_content(self, document_path: str, query: str = None) -> Tuple[bool, str]:
         r"""Extract the content of a given document (or url) and return the processed text.
         It may filter out some information, resulting in inaccurate content.
@@ -308,7 +312,7 @@ Query:
             return True
     
 
-    @retry(requests.RequestException)
+    @retry(requests.RequestException, tries=3, delay=2, backoff=2, max_delay=30)
     async def _extract_content_with_chunkr(self, document_path: str, output_format: Literal['json', 'markdown'] = 'markdown') -> str:
         
         chunkr = Chunkr(api_key=os.getenv("CHUNKR_API_KEY"))
@@ -342,11 +346,15 @@ Query:
         return extracted_text
     
     
-    @retry(requests.RequestException, delay=60, backoff=2, max_delay=120)
+    # Bounded retry + explicit (connect, read) timeout. Without a timeout a
+    # webpage GET can hang forever (server accepts the connection then never
+    # responds), and the default `retry` tries=-1 made that an *infinite* retry
+    # loop — a single slow URL wedged the whole GAIA task. Cap both.
+    @retry(requests.RequestException, tries=3, delay=2, backoff=2, max_delay=30)
     def _extract_webpage_content_with_html2text(self, url: str) -> str:
         import html2text
         h = html2text.HTML2Text()
-        response = requests.get(url, headers=self.headers)
+        response = requests.get(url, headers=self.headers, timeout=(5, 15))
         html_content = response.text
         
         h.ignore_links = False
@@ -355,24 +363,81 @@ Query:
         extracted_text = h.handle(html_content)
         return extracted_text
     
-    @retry(requests.RequestException, delay=60, backoff=2, max_delay=120)
+    @retry(requests.RequestException, tries=3, delay=2, backoff=2, max_delay=30)
     def _extract_webpage_content_with_beautifulsoup(self, url: str) -> str:
-        response = requests.get(url, headers=self.headers)
+        response = requests.get(url, headers=self.headers, timeout=(5, 15))
         html_content = response.text
         soup = BeautifulSoup(html_content, 'html.parser')
         extracted_text = soup.get_text()
         return extracted_text
-    
 
-    @retry(RuntimeError, delay=60, backoff=2, max_delay=120)
+    def _looks_like_challenge(self, text: str) -> bool:
+        """Heuristic: did a bare-HTTP fetch get a bot-protection / JS-challenge
+        page (or near-empty body) instead of the real content?"""
+        if not text or len(text.strip()) < 200:
+            return True
+        low = text.lower()
+        markers = (
+            "just a moment", "checking your browser", "verify you are human",
+            "security verification", "enable javascript", "captcha",
+            "access denied", "cloudflare", "ddos protection",
+        )
+        return any(m in low for m in markers)
+
+    async def _browser_fetch_html(self, url: str) -> str:
+        """Render the page in a real headless Chromium and return its DOM HTML.
+        Runs JS and carries a browser fingerprint, so it gets through most
+        JS-gated / bot-protected pages that the bare requests.get path can't."""
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            try:
+                ctx = await browser.new_context(user_agent=self.headers["User-Agent"])
+                page = await ctx.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    # let JS / a bot challenge settle (bounded)
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                return await page.content()
+            finally:
+                await browser.close()
+
+    def _extract_webpage_content_with_browser(self, url: str) -> str:
+        import html2text
+        # nest_asyncio (applied at import) lets asyncio.run work even when the
+        # caller is already inside an event loop.
+        html_content = asyncio.run(self._browser_fetch_html(url))
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.ignore_tables = False
+        return h.handle(html_content)
+
+
+    @retry(RuntimeError, tries=3, delay=5, backoff=2, max_delay=30)
     def _extract_webpage_content(self, url: str) -> str:
         api_key = os.getenv("FIRECRAWL_API_KEY")
 
         # Skip Firecrawl entirely without an API key — its constructor raises
         # ValueError before reaching the try block, so the exception cannot be
-        # caught here. Go straight to the local html2text path.
+        # caught here. Use the local html2text path, and fall back to a real
+        # headless browser when bare HTTP fails or gets a bot-challenge page.
         if not api_key:
-            return self._extract_webpage_content_with_html2text(url)
+            try:
+                text = self._extract_webpage_content_with_html2text(url)
+                if self._looks_like_challenge(text):
+                    logger.warning(
+                        f"html2text got a challenge/empty page for {url}; "
+                        f"retrying via headless browser")
+                    return self._extract_webpage_content_with_browser(url)
+                return text
+            except Exception as e:
+                logger.warning(
+                    f"html2text failed for {url} ({type(e).__name__}: {e}); "
+                    f"falling back to headless browser")
+                return self._extract_webpage_content_with_browser(url)
 
         try:
             from firecrawl import FirecrawlApp
@@ -419,8 +484,8 @@ Query:
     def _download_file(self, url: str):
         r"""Download a file from a URL and save it to the cache directory."""
         try:
-            response = requests.get(url, stream=True, headers=self.headers)
-            response.raise_for_status() 
+            response = requests.get(url, stream=True, headers=self.headers, timeout=(5, 15))
+            response.raise_for_status()
             file_name = url.split("/")[-1]  
 
             file_path = os.path.join(self.cache_dir, file_name)

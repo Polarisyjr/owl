@@ -133,7 +133,7 @@ class SearchToolkit(BaseToolkit):
         }
         
         try:
-            response = requests.get(base_url, params=params)
+            response = requests.get(base_url, params=params, timeout=(5, 10))
             response.raise_for_status()
         except requests.RequestException as e:
             print(f"Request error: {e}")
@@ -469,7 +469,7 @@ class SearchToolkit(BaseToolkit):
             "summary": summary,
         }
 
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=(5, 10))
         data = response.json()["web"]
         return data
 
@@ -537,7 +537,7 @@ class SearchToolkit(BaseToolkit):
         # Fetch the results given the URL
         try:
             # Make the get
-            result = requests.get(url)
+            result = requests.get(url, timeout=(5, 10))
             data = result.json()
 
             # Get the result items
@@ -724,7 +724,7 @@ class SearchToolkit(BaseToolkit):
         }
 
         # Send the request
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=(5, 30))
         root = ET.fromstring(response.text)
 
         # Extracting step-by-step steps, including 'SBSStep' and 'SBSHintStep'
@@ -851,7 +851,7 @@ class SearchToolkit(BaseToolkit):
             }
         )
         try:
-            response = requests.post(url, headers=headers, data=payload)
+            response = requests.post(url, headers=headers, data=payload, timeout=(5, 10))
             if response.status_code != 200:
                 return {
                     "error": (
@@ -891,7 +891,7 @@ class SearchToolkit(BaseToolkit):
             }
             params = {"wd": query, "rn": str(max_results)}
 
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params, timeout=(5, 15))
             response.encoding = "utf-8"
 
             soup = BeautifulSoup(response.text, "html.parser")
@@ -946,8 +946,8 @@ class SearchToolkit(BaseToolkit):
         try:
             no_timestamp_url = f"https://archive.org/wayback/available?url={url}"
             archive_url = no_timestamp_url + f"&timestamp={date}"
-            response = requests.get(archive_url).json()
-            response_notimestamp = requests.get(no_timestamp_url).json()
+            response = requests.get(archive_url, timeout=(5, 30)).json()
+            response_notimestamp = requests.get(no_timestamp_url, timeout=(5, 30)).json()
             if "archived_snapshots" in response and "closest" in response["archived_snapshots"]:
                 closest = response["archived_snapshots"]["closest"]
 

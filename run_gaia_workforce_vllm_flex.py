@@ -36,7 +36,9 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+import signal
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -82,7 +84,11 @@ class VllmEndpoint:
 # the script's directory so the script behaves identically regardless of CWD.
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _TMP_DIR = _SCRIPT_DIR / "tmp"
-_RESULTS_DIR = _SCRIPT_DIR / "results"
+# Results dir is overridable so a sweep can isolate each setting under its own
+# <ts>-sweep/sweep_w<W>/ folder (CORAL-style) — separate folders mean no shared
+# answer file accumulates, so a later setting can't "resume"/skip another's tasks,
+# while every setting's results are preserved for review.
+_RESULTS_DIR = Path(os.environ.get("GAIA_RESULTS_DIR") or (_SCRIPT_DIR / "results"))
 _DATA_DIR = _SCRIPT_DIR / "data" / "gaia"
 
 # Endpoint config is YAML-driven. Default path is `gaia_workforce.yaml`
@@ -400,11 +406,28 @@ _proc_benchmark: Optional[GAIABenchmark] = None
 _proc_worker_id: Optional[int] = None
 
 
+class _TaskTimeout(Exception):
+    """Raised in a worker's main thread by SIGALRM when a single GAIA task
+    exceeds its wall-clock budget (a task hung in a non-LLM tool op — e.g. a
+    browser navigation/click — would otherwise occupy its concurrency slot
+    forever, so steady-mode can never refill it and the offered load decays)."""
+
+
+def _task_alarm_handler(signum, frame):
+    raise _TaskTimeout()
+
+
 def _proc_init(data_dir: str, save_to: str) -> None:
     """Per-worker-process initializer. Builds the Workforce once and stashes
     it on a module global so every task this worker runs reuses it."""
     global _proc_workforce, _proc_benchmark, _proc_worker_id
     _proc_worker_id = os.getpid()
+    # Per-task watchdog: SIGALRM fires in this worker's main thread (where the
+    # submitted callable runs), interrupting a hung task. No-op if unsupported.
+    try:
+        signal.signal(signal.SIGALRM, _task_alarm_handler)
+    except (ValueError, OSError):
+        pass
     _proc_benchmark = GAIABenchmark(data_dir=data_dir, save_to=save_to)
     # _proc_benchmark.load()
     _proc_workforce = construct_workforce(worker_id=_proc_worker_id)
@@ -427,6 +450,7 @@ def _proc_run_one(
     tries = 0
     trajectory_with_retry: List[dict] = []
     final_result: Optional[Dict[str, Any]] = None
+    _task_to = int(os.environ.get("GAIA_TASK_TIMEOUT_S", "0") or "0")
 
     while not success and tries < max_tries:
         tries += 1
@@ -435,6 +459,8 @@ def _proc_run_one(
             f"(worker pid={_proc_worker_id})"
         )
         try:
+            if _task_to > 0:
+                signal.alarm(_task_to)   # watchdog for this attempt
             valid, error_msg = bench._prepare_task(task)
             if not valid:
                 logger.error(error_msg)
@@ -478,6 +504,30 @@ def _proc_run_one(
                     "attempts": tries,
                     "trajectory": trajectory_with_retry,
                 }
+        except _TaskTimeout:
+            # hung task — abort this attempt, don't retry, free the slot so a
+            # steady-mode refill can keep concurrency pinned.
+            logger.error(
+                f"[timeout] task {task['task_id']} exceeded {_task_to}s "
+                f"(worker pid={_proc_worker_id}); aborting to free the slot"
+            )
+            try:
+                if wf.is_running():
+                    wf.stop()
+            except Exception:
+                pass
+            final_result = {
+                "task_id": task["task_id"],
+                "question": task["Question"],
+                "level": task["Level"],
+                "model_answer": None,
+                "ground_truth": task["Final answer"],
+                "score": False,
+                "attempts": tries,
+                "trajectory": trajectory_with_retry,
+                "timed_out": True,
+            }
+            break
         except Exception as e:
             logger.error(f"Error in processing task (attempt {tries}): {e}")
             if tries == max_tries:
@@ -491,6 +541,9 @@ def _proc_run_one(
                     "attempts": tries,
                     "trajectory": trajectory_with_retry,
                 }
+        finally:
+            if _task_to > 0:
+                signal.alarm(0)   # disarm before next attempt / return
 
     return final_result
 
@@ -561,12 +614,91 @@ def _run_gaia_parallel(
     return benchmark._generate_summary()
 
 
+def _run_gaia_steady(
+    benchmark: GAIABenchmark,
+    on: str,
+    level: int,
+    max_tries: int,
+    max_replanning_tries: int,
+    max_workers: int,
+    wall_s: float,
+    subset: Optional[int] = None,
+    test_idx: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Steady-concurrency LOAD runner: hold exactly `max_workers` GAIA tasks
+    in-flight at all times by refilling from a seeded, *cycled* task queue, until
+    `wall_s` seconds elapse (then stop refilling and drain).
+
+    Unlike `_run_gaia_parallel` (fire the sampled set once -> concurrency decays
+    as tasks finish), this keeps concurrency pinned at W for the whole window by
+    re-submitting a new task the instant one completes, cycling the sampled tasks
+    when they run out. Because tasks are REPEATED, this is a load-generation mode:
+    completed task_ids are NOT skipped and results are NOT saved.
+    """
+    tasks = benchmark._load_tasks(on, level, randomize=False, subset=subset, idx=test_idx)
+    if not tasks:
+        logger.warning("[steady] no tasks resolved; nothing to run")
+        return {"correct": 0, "total": 0, "accuracy": 0.0}
+
+    from itertools import cycle as _cycle
+    queue = _cycle(tasks)
+    deadline = time.monotonic() + wall_s
+    ctx = mp.get_context("spawn")
+    correct = total = 0
+    seen: Dict[str, Any] = {}   # first result per task_id, saved for review
+    last_log = time.monotonic()
+    logger.info(
+        f"[steady] pinning {max_workers} concurrent workforce(s) over "
+        f"{len(tasks)} sampled task(s) (cycled) for {wall_s:.0f}s"
+    )
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=ctx,
+        initializer=_proc_init,
+        initargs=(str(benchmark.data_dir), benchmark.save_to),
+    ) as ex:
+        inflight = {ex.submit(_proc_run_one, next(queue), max_tries, max_replanning_tries)
+                    for _ in range(max_workers)}
+        while inflight:
+            done, inflight = wait(inflight, timeout=10, return_when=FIRST_COMPLETED)
+            refill = time.monotonic() < deadline
+            for fut in done:
+                try:
+                    r = fut.result()
+                    if r is not None:
+                        total += 1
+                        if r.get("score"):
+                            correct += 1
+                        # preserve the first result per unique task for review
+                        # (repeats are load-only); save to the per-setting file.
+                        tid = r.get("task_id")
+                        if tid is not None and tid not in seen:
+                            seen[tid] = r
+                            benchmark._save_results_to_file(
+                                list(seen.values()), benchmark.save_to)
+                except Exception as e:
+                    logger.error(f"[steady] worker exception: {e}")
+                if refill:
+                    inflight.add(ex.submit(_proc_run_one, next(queue),
+                                           max_tries, max_replanning_tries))
+            if time.monotonic() - last_log >= 30:
+                phase = "filling" if refill else "draining"
+                logger.info(f"[steady] {phase}: {len(inflight)} in-flight, "
+                            f"{total} task-runs done ({correct} correct)")
+                last_log = time.monotonic()
+    acc = correct / total if total else 0.0
+    logger.success(f"[steady] done: {total} task-runs, {correct} correct, acc={acc:.3f}")
+    return {"correct": correct, "total": total, "accuracy": acc}
+
+
 def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
                      test_idx: Optional[List[int]] = None,
                      save_result: bool = True,
                      max_workers: int = 1,
                      subset: Optional[int] = None,
-                     max_replanning_tries: int = 2):
+                     max_replanning_tries: int = 2,
+                     steady: bool = False,
+                     steady_wall_s: float = 0.0):
     """Full GAIA benchmark sweep.
 
     Args:
@@ -579,13 +711,27 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
     if test_idx is None and subset is None:
         test_idx = [1]
 
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     save_path = str(_RESULTS_DIR / f"workforce_{level}_pass{max_tries}_vllm.json")
     if _TMP_DIR.exists():
         shutil.rmtree(_TMP_DIR)
 
     benchmark = GAIABenchmark(data_dir=str(_DATA_DIR), save_to=save_path)
 
-    if max_workers <= 1:
+    if steady:
+        # steady-concurrency load mode (refilling cycled queue) — any W, no save.
+        result = _run_gaia_steady(
+            benchmark,
+            on=on,
+            level=level,
+            test_idx=test_idx,
+            max_tries=max_tries,
+            max_replanning_tries=max_replanning_tries,
+            max_workers=max_workers,
+            wall_s=steady_wall_s,
+            subset=subset,
+        )
+    elif max_workers <= 1:
         workforce = construct_workforce(worker_id=0)
         result = benchmark.run_workforce_with_retry(
             workforce,
@@ -651,6 +797,11 @@ if __name__ == "__main__":
             kwargs["max_replanning_tries"] = int(_v)
         if (_v := os.environ.get("GAIA_TEST_IDX")):
             kwargs["test_idx"] = [int(x) for x in _v.split(",") if x.strip()]
+        # Steady-concurrency load mode: GAIA_STEADY=1 holds max_workers tasks
+        # in-flight (refilling a cycled seeded queue) for GAIA_STEADY_WALL_S secs.
+        if os.environ.get("GAIA_STEADY", "").lower() in ("1", "true", "yes"):
+            kwargs["steady"] = True
+            kwargs["steady_wall_s"] = float(os.environ.get("GAIA_STEADY_WALL_S", "600"))
 
         evaluate_on_gaia(max_workers=max_workers, subset=subset, **kwargs)
     else:
