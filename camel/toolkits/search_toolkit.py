@@ -54,7 +54,11 @@ class SearchToolkit(BaseToolkit):
         result: str
 
         try:
-            page = wikipedia.page(entity)
+            # auto_suggest=True (the library default) routes the query through
+            # Wikipedia's opensearch "did you mean" endpoint, which mangles
+            # already-correct titles (e.g. "France"->"freance", "Paris"->"Perić")
+            # and yields PageError / wrong pages. Disable it.
+            page = wikipedia.page(entity, auto_suggest=False)
             result_dict = {
                 'url': page.url,
                 'title': page.title,
