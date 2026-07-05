@@ -61,3 +61,7 @@ camel/utils/__pycache_/
 
 data/*
 
+results/*
+
+# GAIA per-task document-conversion artifacts (e.g. <uuid>.docx.md)
+*.docx.md
