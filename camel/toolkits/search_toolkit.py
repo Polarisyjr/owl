@@ -51,6 +51,18 @@ class SearchToolkit(BaseToolkit):
         """
         import wikipedia
 
+        # The goldsmith `wikipedia` lib ships a generic default UA
+        # ("wikipedia (https://github.com/goldsmith/Wikipedia/)") that Wikimedia's
+        # API now rejects/empties, which surfaces here as a JSONDecodeError
+        # ("Expecting value: line 1 column 1 (char 0)") and makes every wiki
+        # search fail. Set a descriptive User-Agent per Wikimedia's UA policy so
+        # api.php returns results. set_user_agent just sets a module global, so
+        # calling it per-invocation is cheap and idempotent.
+        wikipedia.set_user_agent(
+            "owl-gaia-workforce/1.0 "
+            "(https://github.com/camel-ai/owl; research benchmark use)"
+        )
+
         result: str
 
         try:
@@ -260,18 +272,41 @@ class SearchToolkit(BaseToolkit):
             List[Dict[str, Any]]: A list of dictionaries where each dictionary
                 represents a search result.
         """
+        import time
+
         from ddgs import DDGS
-        from requests.exceptions import RequestException
 
         ddgs = DDGS()
         responses: List[Dict[str, Any]] = []
 
+        def _ddg_with_retry(fn, *, backoffs=(10,)):
+            # DuckDuckGo throttles datacenter IPs non-deterministically: even a
+            # single isolated call fails ~50% of the time, and ddgs>=9 RAISES
+            # `DDGSException("No results found.")` (NOT a requests error, so the
+            # old `except RequestException` never caught it — that's the bug that
+            # surfaced as "Error executing async tool 'search_duckduckgo'").
+            # Empirically the throttle clears within ~10s, so retry ONCE after a
+            # 10s wait: measured ~50% -> ~83% success. A 2nd 10s retry barely
+            # helps (a call still throttled after 10s is usually in a longer
+            # block that another 10s won't clear) and just adds latency, so we
+            # stop at one. backoffs = the sleep before each retry; len+1 attempts.
+            last_err = None
+            for attempt, wait in enumerate((0, *backoffs)):
+                if wait:
+                    time.sleep(wait)
+                try:
+                    res = list(fn(query, max_results=max_results))
+                    if res:
+                        return res, None
+                    last_err = "No results found."
+                except Exception as e:  # DDGSException / RatelimitException / ...
+                    last_err = e
+            return [], last_err
+
         if source == "text":
-            try:
-                results = ddgs.text(query, max_results=max_results)
-            except RequestException as e:
-                # Handle specific exceptions or general request exceptions
-                responses.append({"error": f"duckduckgo search failed.{e}"})
+            results, err = _ddg_with_retry(ddgs.text)
+            if not results and err is not None:
+                responses.append({"error": f"duckduckgo search failed: {err}"})
 
             # Iterate over results found
             for i, result in enumerate(results, start=1):
@@ -285,11 +320,9 @@ class SearchToolkit(BaseToolkit):
                 responses.append(response)
 
         elif source == "images":
-            try:
-                results = ddgs.images(query, max_results=max_results)
-            except RequestException as e:
-                # Handle specific exceptions or general request exceptions
-                responses.append({"error": f"duckduckgo search failed.{e}"})
+            results, err = _ddg_with_retry(ddgs.images)
+            if not results and err is not None:
+                responses.append({"error": f"duckduckgo search failed: {err}"})
 
             # Iterate over results found
             for i, result in enumerate(results, start=1):
@@ -304,11 +337,9 @@ class SearchToolkit(BaseToolkit):
                 responses.append(response)
 
         elif source == "videos":
-            try:
-                results = ddgs.videos(query, max_results=max_results)
-            except RequestException as e:
-                # Handle specific exceptions or general request exceptions
-                responses.append({"error": f"duckduckgo search failed.{e}"})
+            results, err = _ddg_with_retry(ddgs.videos)
+            if not results and err is not None:
+                responses.append({"error": f"duckduckgo search failed: {err}"})
 
             # Iterate over results found
             for i, result in enumerate(results, start=1):

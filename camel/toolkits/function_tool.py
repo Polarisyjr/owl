@@ -32,6 +32,49 @@ from camel.utils import get_pydantic_object_schema, to_pascal
 logger = logging.getLogger(__name__)
 
 
+# --- step3 tool-attribution lane (opt-in via env) --------------------------
+# When STEP3_TOOL_LOG points at a file, every tool execution appends one JSONL
+# record {ts_start, ts_end, tool, chain, pid, success} there. This is the owl
+# analog of trae's option-A test-run instrumentation: FunctionTool.__call__ /
+# .async_call are the single choke point every toolkit call passes through, so
+# the whole GAIA workforce's off-GPU tool work becomes a timeline lane without
+# touching any toolkit. No-op (near-zero cost) when the env var is unset.
+import json as _json
+import os as _os
+import time as _time
+
+
+def _step3_tool_name(func: Callable) -> str:
+    return getattr(func, "__name__", None) or repr(func)
+
+
+def _step3_tool_chain(func: Callable) -> str:
+    r"""Lane label: '<pid>/<ToolkitClass>' — pid separates concurrent GAIA tasks
+    (each runs in its own ProcessPoolExecutor worker), the toolkit class is a
+    good proxy for the worker role (BrowserToolkit->web, ...)."""
+    owner = getattr(func, "__self__", None)
+    cls = type(owner).__name__ if owner is not None else "func"
+    return f"{_os.getpid()}/{cls}"
+
+
+def _step3_log_tool(t0: float, t1: float, func: Callable, ok: bool) -> None:
+    path = _os.environ.get("STEP3_TOOL_LOG")
+    if not path:
+        return
+    try:
+        rec = {"ts_start": round(t0, 3), "ts_end": round(t1, 3),
+               "tool": _step3_tool_name(func), "chain": _step3_tool_chain(func),
+               "pid": _os.getpid(), "success": ok}
+        with open(path, "a") as f:
+            f.write(_json.dumps(rec) + "\n")
+    except Exception:
+        pass  # never let instrumentation break a run
+
+
+def _step3_enabled() -> bool:
+    return bool(_os.environ.get("STEP3_TOOL_LOG"))
+
+
 def _remove_a_key(d: Dict, remove_key: Any) -> None:
     r"""Remove a key from a dictionary recursively."""
     if isinstance(d, dict):
@@ -388,8 +431,11 @@ class FunctionTool:
             return result
         else:
             # Pass the extracted arguments to the indicated function
+            t0 = _time.time() if _step3_enabled() else None
+            ok = False
             try:
                 result = self.func(*args, **kwargs)
+                ok = True
                 return result
             except Exception as e:
                 raise ValueError(
@@ -397,15 +443,26 @@ class FunctionTool:
                     f"arguments {args} and {kwargs}. "
                     f"Error: {e}"
                 )
+            finally:
+                if t0 is not None:
+                    _step3_log_tool(t0, _time.time(), self.func, ok)
 
     async def async_call(self, *args: Any, **kwargs: Any) -> Any:
         if self.synthesize_output:
             result = self.synthesize_execution_output(args, kwargs)
             return result
-        if self.is_async:
-            return await self.func(*args, **kwargs)
-        else:
-            return self.func(*args, **kwargs)
+        t0 = _time.time() if _step3_enabled() else None
+        ok = False
+        try:
+            if self.is_async:
+                result = await self.func(*args, **kwargs)
+            else:
+                result = self.func(*args, **kwargs)
+            ok = True
+            return result
+        finally:
+            if t0 is not None:
+                _step3_log_tool(t0, _time.time(), self.func, ok)
 
     @property
     def is_async(self) -> bool:

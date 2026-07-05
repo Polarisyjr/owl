@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import random
 import shutil
+import threading
 import time
 import signal
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -691,6 +693,157 @@ def _run_gaia_steady(
     return {"correct": correct, "total": total, "accuracy": acc}
 
 
+def _run_gaia_rps(
+    benchmark: GAIABenchmark,
+    on: str,
+    level: int,
+    max_tries: int,
+    max_replanning_tries: int,
+    max_workers: int,
+    wall_s: float,
+    rps: float,
+    seed: int = 0,
+    subset: Optional[int] = None,
+    test_idx: Optional[List[int]] = None,
+    cycle: bool = False,
+) -> Dict[str, Any]:
+    """Open-loop OPEN-ARRIVAL runner: submit GAIA tasks as a Poisson(rps) process
+    (exponential inter-arrival times), then drain the in-flight tasks.
+
+    Task supply (mirrors sweep.sh's finite, seeded, shuffle-then-prefix sampling —
+    the sampled --idx set is passed in via test_idx):
+      * cycle=False (default): submit the resolved FINITE task set exactly ONCE,
+        then stop. Total submissions == len(tasks) <= dataset size, so there is
+        no unbounded queue buildup. `wall_s` is only an upper time bound (stop
+        submitting early if it is reached first).
+      * cycle=True: repeat the set indefinitely (load-generation) until `wall_s`,
+        like steady mode. Only then can submissions exceed the dataset size.
+
+    Contrast with `_run_gaia_steady` (closed-loop: pin exactly `max_workers`
+    in-flight). Here `max_workers` is only a CAP: arrivals are driven by `rps`,
+    so realized concurrency is an emergent random variable ~ rps * task_time
+    (Little's law), bounded above by `max_workers`. If rps*task_time approaches
+    `max_workers` the pool saturates and the effective start-rate falls below
+    `rps` — surfaced as a "backlog" warning. Does NOT skip/save by task_id; the
+    first result per unique task is saved for review.
+    """
+    tasks = list(benchmark._load_tasks(on, level, randomize=False, subset=subset, idx=test_idx))
+    if not tasks:
+        logger.warning("[rps] no tasks resolved; nothing to run")
+        return {"correct": 0, "total": 0, "accuracy": 0.0}
+    if rps <= 0:
+        logger.warning("[rps] rps must be > 0; nothing to run")
+        return {"correct": 0, "total": 0, "accuracy": 0.0}
+
+    # Seeded shuffle of the resolved pool (mirrors sweep.sh's shuffle-then-prefix
+    # sampling): the arrival stream is a reproducible random permutation of the
+    # whole set, so mixed levels/durations are spread over time rather than
+    # clustered by level order. Uses a dedicated RNG so it doesn't perturb the
+    # arrival-timing RNG below (both seeded => fully reproducible).
+    random.Random(seed).shuffle(tasks)
+
+    from itertools import cycle as _cycle
+    queue = _cycle(tasks) if cycle else iter(tasks)
+    ctx = mp.get_context("spawn")
+    rng = random.Random(seed)
+    inflight: set = set()
+    lock = threading.Lock()
+    submit_done = threading.Event()
+    submitted = 0
+    correct = total = 0
+    seen: Dict[str, Any] = {}
+    supply = ("cycled/unbounded" if cycle
+              else f"finite: {len(tasks)} task(s), submitted once")
+    logger.info(
+        f"[rps] Poisson arrivals at {rps:.3g} task/s (seed={seed}); "
+        f"supply={supply}; wall<={wall_s:.0f}s; pool cap max_workers={max_workers}; "
+        f"expected steady in-flight ~= rps*task_time (keep < cap to hold the rate)"
+    )
+
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=ctx,
+        initializer=_proc_init,
+        initargs=(str(benchmark.data_dir), benchmark.save_to),
+    ) as ex:
+
+        def _submitter():
+            nonlocal submitted
+            deadline = time.monotonic() + wall_s
+            while True:
+                # exponential inter-arrival => Poisson process at rate `rps`
+                wait_s = rng.expovariate(rps)
+                if time.monotonic() + wait_s >= deadline:
+                    logger.info("[rps] wall reached; stop submitting")
+                    break
+                time.sleep(wait_s)
+                try:
+                    task = next(queue)      # finite iter exhausts (cycle=False)
+                except StopIteration:
+                    logger.info(f"[rps] finite task set exhausted after "
+                                f"{submitted} submission(s); stop submitting")
+                    break
+                fut = ex.submit(_proc_run_one, task,
+                                max_tries, max_replanning_tries)
+                with lock:
+                    inflight.add(fut)
+                    submitted += 1
+            submit_done.set()
+
+        submitter = threading.Thread(target=_submitter, name="rps-submitter", daemon=True)
+        submitter.start()
+
+        last_log = time.monotonic()
+        while True:
+            with lock:
+                current = list(inflight)
+            if not current:
+                if submit_done.is_set():
+                    break
+                time.sleep(0.2)
+                continue
+            done, _ = wait(current, timeout=5, return_when=FIRST_COMPLETED)
+            for fut in done:
+                with lock:
+                    inflight.discard(fut)
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    logger.error(f"[rps] worker exception: {e}")
+                    continue
+                if r is None:
+                    continue
+                total += 1
+                if r.get("score"):
+                    correct += 1
+                tid = r.get("task_id")
+                if tid is not None and tid not in seen:
+                    seen[tid] = r
+                    benchmark._save_results_to_file(list(seen.values()), benchmark.save_to)
+            if time.monotonic() - last_log >= 30:
+                with lock:
+                    n_inflight = len(inflight)
+                # futures beyond the pool size are queued inside the executor,
+                # i.e. arrivals that could not start => the offered rps exceeds
+                # what `max_workers` can serve at this task duration.
+                backlog = max(0, n_inflight - max_workers)
+                phase = "arriving" if not submit_done.is_set() else "draining"
+                msg = (f"[rps] {phase}: {n_inflight} in-flight "
+                       f"(cap {max_workers}), {submitted} submitted, "
+                       f"{total} done ({correct} correct)")
+                if backlog > 0:
+                    logger.warning(msg + f"; BACKLOG {backlog} queued — "
+                                   f"rps too high for max_workers, rate not held")
+                else:
+                    logger.info(msg)
+                last_log = time.monotonic()
+
+    acc = correct / total if total else 0.0
+    logger.success(f"[rps] done: {submitted} submitted, {total} task-runs, "
+                   f"{correct} correct, acc={acc:.3f}")
+    return {"correct": correct, "total": total, "accuracy": acc}
+
+
 def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
                      test_idx: Optional[List[int]] = None,
                      save_result: bool = True,
@@ -698,7 +851,11 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
                      subset: Optional[int] = None,
                      max_replanning_tries: int = 2,
                      steady: bool = False,
-                     steady_wall_s: float = 0.0):
+                     steady_wall_s: float = 0.0,
+                     rps: float = 0.0,
+                     rps_wall_s: float = 0.0,
+                     rps_seed: int = 0,
+                     rps_cycle: bool = False):
     """Full GAIA benchmark sweep.
 
     Args:
@@ -718,7 +875,24 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
 
     benchmark = GAIABenchmark(data_dir=str(_DATA_DIR), save_to=save_path)
 
-    if steady:
+    if rps > 0:
+        # open-loop Poisson-arrival load mode: submit at `rps` task/s for
+        # rps_wall_s, then drain. max_workers is only a cap. No skip/save by id.
+        result = _run_gaia_rps(
+            benchmark,
+            on=on,
+            level=level,
+            test_idx=test_idx,
+            max_tries=max_tries,
+            max_replanning_tries=max_replanning_tries,
+            max_workers=max_workers,
+            wall_s=rps_wall_s,
+            rps=rps,
+            seed=rps_seed,
+            subset=subset,
+            cycle=rps_cycle,
+        )
+    elif steady:
         # steady-concurrency load mode (refilling cycled queue) — any W, no save.
         result = _run_gaia_steady(
             benchmark,
@@ -802,6 +976,18 @@ if __name__ == "__main__":
         if os.environ.get("GAIA_STEADY", "").lower() in ("1", "true", "yes"):
             kwargs["steady"] = True
             kwargs["steady_wall_s"] = float(os.environ.get("GAIA_STEADY_WALL_S", "600"))
+        # Open-loop Poisson-arrival load mode: GAIA_RPS=λ submits tasks at λ/s
+        # (exponential inter-arrivals) for GAIA_RPS_WALL_S secs, then drains.
+        # max_workers stays a cap; GAIA_RPS_SEED makes the arrival stream
+        # reproducible. Takes precedence over GAIA_STEADY.
+        if (_v := os.environ.get("GAIA_RPS")):
+            kwargs["rps"] = float(_v)
+            kwargs["rps_wall_s"] = float(os.environ.get("GAIA_RPS_WALL_S", "600"))
+            kwargs["rps_seed"] = int(os.environ.get("GAIA_RPS_SEED", "0"))
+            # default: submit the finite task set once (like sweep). Set
+            # GAIA_RPS_CYCLE=1 to repeat it for sustained load-generation.
+            kwargs["rps_cycle"] = os.environ.get(
+                "GAIA_RPS_CYCLE", "").lower() in ("1", "true", "yes")
 
         evaluate_on_gaia(max_workers=max_workers, subset=subset, **kwargs)
     else:

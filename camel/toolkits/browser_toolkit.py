@@ -114,6 +114,18 @@ ACTION_WITH_FEEDBACK_LIST = [
 ]
 
 
+# Every browser action the agent is allowed to emit (mirrors the numbered list
+# in AVAILABLE_ACTIONS_PROMPT). ASYNC_ACTIONS are awaited; the remaining ones
+# (get_url, ask_question_about_video) run synchronously. Used to reject
+# hallucinated action names (e.g. `manual_scanning`) with an actionable message
+# instead of letting `self.browser.<name>(...)` raise a bare AttributeError,
+# which the agent can't recover from and just retries in a loop.
+VALID_BROWSER_ACTIONS = set(ASYNC_ACTIONS) | {
+    "get_url",
+    "ask_question_about_video",
+}
+
+
 # Code from magentic-one
 class DOMRectangle(TypedDict):
     x: Union[int, float]
@@ -818,6 +830,11 @@ class BaseBrowser:
             )
             return f"Element with identifier '{identifier}' not found."
 
+        if target.count() == 0:  # fast-fail on bad id (else 30s hang below)
+            return (
+                f"No element with id '{identifier}'. Use a NUMERIC element id "
+                f"from the observation (e.g. 12), not an HTML id or name."
+            )
         target.scroll_into_view_if_needed()
 
         file_path = os.path.join(self.cache_dir)
@@ -860,6 +877,11 @@ class BaseBrowser:
             )
             return f"Element with identifier '{identifier}' not found."
 
+        if target.count() == 0:  # fast-fail on bad id (else 30s hang below)
+            return (
+                f"No element with id '{identifier}'. Use a NUMERIC element id "
+                f"from the observation (e.g. 12), not an HTML id or name."
+            )
         target.scroll_into_view_if_needed()
         target.focus()
         try:
@@ -905,6 +927,11 @@ class BaseBrowser:
             )
             return f"Element with identifier '{identifier}' not found."
 
+        if target.count() == 0:  # fast-fail on bad id (else 30s hang below)
+            return (
+                f"No element with id '{identifier}'. Use a NUMERIC element id "
+                f"from the observation (e.g. 12), not an HTML id or name."
+            )
         target.scroll_into_view_if_needed()
         target.hover()
         self._wait_for_load()
@@ -1437,9 +1464,15 @@ class AsyncBaseBrowser:
             logger.debug(f"Error during download operation: {e}")
             logger.warning(f"Element with identifier '{identifier}' not found.")
             return f"Element with identifier '{identifier}' not found."
-        
+
+        if await target.count() == 0:  # fast-fail on bad id (else 30s hang below)
+            return (
+                f"No element with id '{identifier}'. Use a NUMERIC element id "
+                f"from the observation (e.g. 12), not an HTML id or name."
+            )
+
         await target.scroll_into_view_if_needed()
-        
+
         file_path = os.path.join(self.cache_dir)
         await self.wait_for_load()
         
@@ -1477,7 +1510,18 @@ class AsyncBaseBrowser:
             logger.debug(f"Error during fill operation: {e}")
             logger.warning(f"Element with identifier '{identifier}' not found.")
             return f"Element with identifier '{identifier}' not found."
-        
+
+        # Fast-fail on a bad id instead of hanging 30s: a non-matching locator
+        # makes scroll_into_view_if_needed() below block for Playwright's 30s
+        # default. count() is instant. Steer the model to the numeric
+        # __elementId (it often passes an HTML id/name like 'search-input',
+        # which matches nothing).
+        if await target.count() == 0:
+            return (
+                f"No element with id '{identifier}'. Use a NUMERIC element id "
+                f"from the observation (e.g. 12), not an HTML id or name."
+            )
+
         await target.scroll_into_view_if_needed()
         await target.focus()
         try:
@@ -1535,6 +1579,11 @@ class AsyncBaseBrowser:
                 f"Element with identifier '{identifier}' not found."
             )
             return f"Element with identifier '{identifier}' not found."
+        if await target.count() == 0:  # fast-fail on bad id (else 30s hang below)
+            return (
+                f"No element with id '{identifier}'. Use a NUMERIC element id "
+                f"from the observation (e.g. 12), not an HTML id or name."
+            )
         await target.scroll_into_view_if_needed()
         await target.hover()
         await self.wait_for_load()
@@ -1953,6 +2002,19 @@ out the information you need. Sometimes they are extremely useful.
 
         action_code = _fix_action_code(action_code)
         prefix = "self.browser."
+
+        func_name = extract_function_name(action_code)
+        if func_name not in VALID_BROWSER_ACTIONS:
+            # Reject hallucinated actions with an actionable message instead of a
+            # bare AttributeError the agent can't recover from. See async_act.
+            time.sleep(1)
+            return (
+                False,
+                f"Unknown action `{func_name}`: not a supported browser "
+                f"action. Choose exactly one action from the available set: "
+                f"{', '.join(sorted(VALID_BROWSER_ACTIONS))}.",
+            )
+
         code = f"{prefix}{action_code}"
 
         try:
@@ -2463,9 +2525,22 @@ class AsyncBrowserToolkit(BaseToolkit):
 
         action_code = _fix_action_code(action_code)
         prefix = "self.browser."
-                
+
+        func_name = extract_function_name(action_code)
+        if func_name not in VALID_BROWSER_ACTIONS:
+            # Reject hallucinated actions (e.g. `manual_scanning`) with a message
+            # the agent can act on, instead of running `self.browser.<name>(...)`
+            # and returning a bare AttributeError it just retries in a loop.
+            await asyncio.sleep(1)
+            return (
+                False,
+                f"Unknown action `{func_name}`: not a supported browser "
+                f"action. Choose exactly one action from the available set: "
+                f"{', '.join(sorted(VALID_BROWSER_ACTIONS))}.",
+            )
+
         code = f"{prefix}{action_code}"
-        async_flag = extract_function_name(action_code) in ASYNC_ACTIONS
+        async_flag = func_name in ASYNC_ACTIONS
         feedback_flag = _check_if_with_feedback(action_code)
         
         try:
