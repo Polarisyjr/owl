@@ -1,30 +1,33 @@
 #!/bin/bash
 # Set up the `owl` conda env + system deps needed to ACTUALLY run GAIA web-browsing
-# tasks on this machine (Azure Linux 3.0 — no apt, so `playwright install-deps`
-# does not work and several deps must be installed explicitly).
+# tasks. Originally written for Azure Linux 3.0 (no apt, dnf only); this host turned
+# out to be Ubuntu 20.04 (apt, no dnf) instead, so both package managers are
+# supported and auto-detected — `playwright install-deps` itself pulls in a huge
+# desktop-environment dependency list (100+ pkgs, most irrelevant to headless
+# rendering) so we still install a small hand-picked list rather than using it.
 #
 # What it does (all idempotent — safe to re-run):
 #   1. ensure miniconda + conda env `owl` (python 3.11)
 #   2. pip install -r requirements.txt  + pinned fixups upstream's file gets wrong
 #   3. install the chromium browser binary for playwright
-#   4. install chromium's system shared libraries (.so) via dnf
+#   4. install chromium's system shared libraries (.so) via dnf or apt
 #   5. install fonts (Latin + CJK + emoji) so pages render glyphs, not tofu boxes
-#   6. install the ffmpeg CLI (absent from Azure Linux repos) via conda-forge
+#   6. install the ffmpeg CLI (often absent from base images) via conda-forge
 #   7. verify: chromium launches headless + ffmpeg is on PATH
 #
-# Requires passwordless sudo for the dnf steps (4 & 5).
+# Requires passwordless sudo for steps 4 & 5.
 #
 # Usage (from anywhere):
 #   bash frameworks/owl/setup_env.sh             # full setup
 #   bash frameworks/owl/setup_env.sh --verify    # skip installs, just run the checks
 #
 # Env overrides:
-#   CONDA_HOME   conda install prefix   (default: $HOME/miniconda3)
+#   CONDA_HOME   conda install prefix   ($CONDA_BASE override > `conda info --base` > ~/miniconda3)
 #   CONDA_ENV    env name               (default: owl)
 
 set -euo pipefail
 
-CONDA_HOME="${CONDA_HOME:-$HOME/miniconda3}"
+CONDA_HOME="${CONDA_HOME:-${CONDA_BASE:-$(conda info --base 2>/dev/null)}}"; [ -n "$CONDA_HOME" ] || CONDA_HOME="$HOME/miniconda3"
 CONDA_ENV="${CONDA_ENV:-owl}"
 OWL_DIR="$(cd "$(dirname "$0")" && pwd)"     # this script lives in frameworks/owl
 ROOT="$(cd "$OWL_DIR/../.." && pwd)"
@@ -32,13 +35,22 @@ REQ="$OWL_DIR/requirements.txt"
 VERIFY_ONLY=0
 [ "${1:-}" = "--verify" ] && VERIFY_ONLY=1
 
-# chromium runtime .so deps (resolved from `dnf provides` on Azure Linux 3.0).
-# playwright install-deps targets apt/Ubuntu and is a no-op here, so install by hand.
-SYS_LIBS=(alsa-lib at-spi2-atk at-spi2-core mesa-libgbm nspr nss-libs nss)
-
-# fonts: DejaVu (Latin), Noto CJK (中文/日本語/한국어), Noto emoji
-FONT_PKGS=(fontconfig dejavu-sans-fonts dejavu-serif-fonts \
-           google-noto-sans-cjk-ttc-fonts google-noto-emoji-fonts)
+# chromium runtime .so deps + fonts, one name list per package manager (dnf names
+# resolved from `dnf provides` on Azure Linux 3.0; apt names are their Debian/
+# Ubuntu equivalents). Detected at run time — whichever of dnf/apt is present wins.
+if command -v dnf >/dev/null 2>&1; then
+    PKG_MGR=dnf
+    SYS_LIBS=(alsa-lib at-spi2-atk at-spi2-core mesa-libgbm nspr nss-libs nss pango)
+    FONT_PKGS=(fontconfig dejavu-sans-fonts dejavu-serif-fonts \
+               google-noto-sans-cjk-ttc-fonts google-noto-emoji-fonts)
+elif command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR=apt
+    SYS_LIBS=(libasound2 libatk-bridge2.0-0 libatk1.0-0 libgbm1 libnspr4 libnss3 libpango-1.0-0)
+    FONT_PKGS=(fontconfig fonts-dejavu-core fonts-dejavu-extra \
+               fonts-noto-cjk fonts-noto-color-emoji)
+else
+    PKG_MGR=""
+fi
 
 # pinned fixups NOT correctly captured by requirements.txt:
 #   sqlalchemy        — camel storage imports it; missing from requirements
@@ -51,14 +63,21 @@ say()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mok\033[0m %s\n' "$*"; }
 die()  { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# Azure Linux runs a background tdnf (e.g. clamav). Don't fight the rpm lock —
-# wait for it, never kill a transaction mid-flight.
-wait_rpm_lock() {
+# Azure Linux runs a background tdnf (e.g. clamav); Ubuntu's unattended-upgrades
+# similarly grabs the dpkg lock in the background. Don't fight either lock — wait
+# for it, never kill a transaction mid-flight.
+wait_pkg_lock() {
+    local lockfile
+    case "$PKG_MGR" in
+        dnf) lockfile=/var/lib/rpm/.rpm.lock ;;
+        apt) lockfile=/var/lib/dpkg/lock ;;
+        *)   return 0 ;;
+    esac
     for _ in $(seq 1 180); do
-        sudo fuser /var/lib/rpm/.rpm.lock >/dev/null 2>&1 || return 0
+        sudo fuser "$lockfile" >/dev/null 2>&1 || return 0
         sleep 5
     done
-    die "rpm lock still held after 15min — another package manager is stuck"
+    die "$PKG_MGR lock still held after 15min — another package manager is stuck"
 }
 
 # --no-capture-output so child stdout (verify prints, pip progress) streams through
@@ -87,18 +106,27 @@ if [ "$VERIFY_ONLY" = "0" ]; then
     conda_run python -m playwright install chromium
     ok "chromium downloaded"
 
-    say "4. chromium system libraries (dnf)"
-    wait_rpm_lock
-    sudo dnf install -y "${SYS_LIBS[@]}"
+    say "4. chromium system libraries ($PKG_MGR)"
+    [ -n "$PKG_MGR" ] || die "neither dnf nor apt-get found — install ${SYS_LIBS[*]:-chromium runtime libs} by hand"
+    wait_pkg_lock
+    if [ "$PKG_MGR" = dnf ]; then
+        sudo dnf install -y "${SYS_LIBS[@]}"
+    else
+        sudo apt-get update -y && sudo apt-get install -y "${SYS_LIBS[@]}"
+    fi
     ok "system libs installed"
 
     say "5. fonts"
-    wait_rpm_lock
-    sudo dnf install -y "${FONT_PKGS[@]}"
+    wait_pkg_lock
+    if [ "$PKG_MGR" = dnf ]; then
+        sudo dnf install -y "${FONT_PKGS[@]}"
+    else
+        sudo apt-get install -y "${FONT_PKGS[@]}"
+    fi
     sudo fc-cache -f >/dev/null 2>&1 || true
     ok "fonts installed ($(fc-list 2>/dev/null | wc -l) families)"
 
-    say "6. ffmpeg CLI (conda-forge — not in Azure Linux repos)"
+    say "6. ffmpeg CLI (conda-forge — not always in base repos)"
     if ! conda_run bash -c 'command -v ffmpeg' >/dev/null 2>&1; then
         "$CONDA_HOME/bin/conda" install -n "$CONDA_ENV" -c conda-forge ffmpeg -y
     fi
@@ -114,7 +142,7 @@ CHROME="$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome 2>
 MISSING="$(ldd "$CHROME" 2>/dev/null | grep -i 'not found' | awk '{print $1}' | sort -u || true)"
 if [ -n "$MISSING" ]; then
     echo "$MISSING" | sed 's/^/  MISSING /'
-    die "chromium still has unresolved libraries (map them with: dnf provides '*/<lib>')"
+    die "chromium still has unresolved libraries (map them with: dnf provides '*/<lib>', or apt-file search <lib>)"
 fi
 ok "no missing chromium libraries"
 
