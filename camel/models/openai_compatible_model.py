@@ -12,7 +12,10 @@
 # limitations under the License.
 # ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
 
+import json
 import os
+import threading
+import time
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -34,6 +37,39 @@ from camel.utils import (
 )
 
 logger = get_logger(__name__)
+
+# Per-call text-to-text latency sidecar. CAMEL's trajectory keeps only role/
+# content messages, so there is no per-LLM-call slot in it; when OWL_T2T_LOG is
+# set we append one JSON line per request (latency + token usage + response id)
+# so a run can be joined back to the message trajectory afterwards.
+#
+# All concurrent GAIA workers append to the SAME file, so each row carries a
+# `pid` (the ProcessPoolExecutor worker) and `task_id` (the worker's current
+# GAIA task, stamped into OWL_T2T_TASK by the runner) — otherwise interleaved
+# rows can't be attributed to a task. The threading.Lock only serializes threads
+# within one process; cross-process append integrity relies on POSIX O_APPEND
+# atomicity (rows are small, well under PIPE_BUF).
+_T2T_LOCK = threading.Lock()
+
+
+def _record_t2t(model_type: Any, latency_s: float, response: Any) -> None:
+    path = os.environ.get("OWL_T2T_LOG")
+    if not path:
+        return
+    usage = getattr(response, "usage", None)  # None for streaming responses
+    row = {
+        "ts": time.time(),
+        "pid": os.getpid(),                          # worker process (concurrency slot)
+        "task_id": os.environ.get("OWL_T2T_TASK"),   # this worker's current GAIA task
+        "t2t_latency_s": latency_s,
+        "model": str(model_type),
+        "response_id": getattr(response, "id", None),
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+    }
+    with _T2T_LOCK:
+        with open(path, "a") as f:
+            f.write(json.dumps(row) + "\n")
 
 
 class OpenAICompatibleModel(BaseModelBackend):
@@ -154,11 +190,14 @@ class OpenAICompatibleModel(BaseModelBackend):
         if tools:
             request_config["tools"] = tools
 
-        return self._client.chat.completions.create(
+        t0 = time.monotonic()
+        response = self._client.chat.completions.create(
             messages=messages,
             model=self.model_type,
             **request_config,
         )
+        _record_t2t(self.model_type, time.monotonic() - t0, response)
+        return response
 
     async def _arequest_chat_completion(
         self,
@@ -170,11 +209,14 @@ class OpenAICompatibleModel(BaseModelBackend):
         if tools:
             request_config["tools"] = tools
 
-        return await self._async_client.chat.completions.create(
+        t0 = time.monotonic()
+        response = await self._async_client.chat.completions.create(
             messages=messages,
             model=self.model_type,
             **request_config,
         )
+        _record_t2t(self.model_type, time.monotonic() - t0, response)
+        return response
 
     def _request_parse(
         self,

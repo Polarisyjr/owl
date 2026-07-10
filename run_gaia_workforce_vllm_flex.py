@@ -448,6 +448,12 @@ def _proc_run_one(
     wf = _proc_workforce
     bench = _proc_benchmark
 
+    # Stamp this worker's current task so the t2t latency sidecar
+    # (OpenAICompatibleModel._record_t2t) can attribute each LLM call to a GAIA
+    # task under ProcessPoolExecutor concurrency. A worker runs one task at a
+    # time, so this env var is unambiguous for the task's whole duration.
+    os.environ["OWL_T2T_TASK"] = str(task.get("task_id", ""))
+
     success = False
     tries = 0
     trajectory_with_retry: List[dict] = []
