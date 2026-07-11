@@ -1469,6 +1469,13 @@ class ChatAgent(BaseAgent):
         args = tool_call_request.args
         tool_call_id = tool_call_request.tool_call_id
         tool = self._internal_tools[func_name]
+        from camel.utils.replay_capture import reset_tool_context, set_tool_context
+
+        capture = func_name != self.__class__.Constants.FUNC_NAME_FOR_STRUCTURE_OUTPUT
+        replay_tokens = set_tool_context(
+            getattr(self, "_agent_replay_actor_id", getattr(self, "role_name", "unknown")),
+            capture=capture,
+        )
         try:
             result = tool(**args)
         except Exception as e:
@@ -1476,6 +1483,8 @@ class ChatAgent(BaseAgent):
             error_msg = f"Error executing tool '{func_name}': {e!s}"
             result = {"error": error_msg}
             logging.warning(error_msg)
+        finally:
+            reset_tool_context(replay_tokens)
 
         return self._record_tool_calling(func_name, args, result, tool_call_id)
 
@@ -1487,6 +1496,13 @@ class ChatAgent(BaseAgent):
         args = tool_call_request.args
         tool_call_id = tool_call_request.tool_call_id
         tool = self._internal_tools[func_name]
+        from camel.utils.replay_capture import reset_tool_context, set_tool_context
+
+        capture = func_name != self.__class__.Constants.FUNC_NAME_FOR_STRUCTURE_OUTPUT
+        replay_tokens = set_tool_context(
+            getattr(self, "_agent_replay_actor_id", getattr(self, "role_name", "unknown")),
+            capture=capture,
+        )
         try:
             result = await tool.async_call(**args)
         except Exception as e:
@@ -1494,6 +1510,8 @@ class ChatAgent(BaseAgent):
             error_msg = f"Error executing async tool '{func_name}': {e!s}"
             result = {"error": error_msg}
             logging.warning(error_msg)
+        finally:
+            reset_tool_context(replay_tokens)
 
         return self._record_tool_calling(func_name, args, result, tool_call_id)
 
