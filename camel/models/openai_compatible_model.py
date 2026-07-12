@@ -19,6 +19,7 @@ import time
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Type, Union
 
+import httpx
 from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
 from pydantic import BaseModel, ValidationError
 
@@ -35,6 +36,7 @@ from camel.utils import (
     BaseTokenCounter,
     OpenAITokenCounter,
 )
+from camel.utils.replay_capture import OpenAIReplayCapture
 
 logger = get_logger(__name__)
 
@@ -108,11 +110,13 @@ class OpenAICompatibleModel(BaseModelBackend):
         super().__init__(
             model_type, model_config_dict, api_key, url, token_counter, timeout
         )
+        replay_capture = OpenAIReplayCapture(self)
         self._client = OpenAI(
             timeout=self._timeout,
             max_retries=3,
             api_key=self._api_key,
             base_url=self._url,
+            http_client=httpx.Client(event_hooks=replay_capture.sync_hooks),
         )
 
         self._async_client = AsyncOpenAI(
@@ -120,6 +124,7 @@ class OpenAICompatibleModel(BaseModelBackend):
             max_retries=3,
             api_key=self._api_key,
             base_url=self._url,
+            http_client=httpx.AsyncClient(event_hooks=replay_capture.async_hooks),
         )
 
     def _run(

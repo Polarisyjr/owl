@@ -13,8 +13,11 @@
 # ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
 import ast
 import inspect
+import json as _json
 import logging
+import os as _os
 import textwrap
+import time as _time
 import warnings
 from inspect import Parameter, getsource, signature
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Type
@@ -28,6 +31,7 @@ from pydantic.fields import FieldInfo
 from camel.models import BaseModelBackend, ModelFactory
 from camel.types import ModelPlatformType, ModelType
 from camel.utils import get_pydantic_object_schema, to_pascal
+from camel.utils.replay_capture import record_tool as _replay_record_tool
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +43,6 @@ logger = logging.getLogger(__name__)
 # .async_call are the single choke point every toolkit call passes through, so
 # the whole GAIA workforce's off-GPU tool work becomes a timeline lane without
 # touching any toolkit. No-op (near-zero cost) when the env var is unset.
-import json as _json
-import os as _os
-import time as _time
-
-
 def _step3_tool_name(func: Callable) -> str:
     return getattr(func, "__name__", None) or repr(func)
 
@@ -432,18 +431,31 @@ class FunctionTool:
         else:
             # Pass the extracted arguments to the indicated function
             t0 = _time.time() if _step3_enabled() else None
+            replay_t0 = _time.time_ns()
             ok = False
+            result = None
+            error = None
             try:
                 result = self.func(*args, **kwargs)
                 ok = True
                 return result
             except Exception as e:
+                error = f"{type(e).__name__}: {e}"
                 raise ValueError(
                     f"Execution of function {self.func.__name__} failed with "
                     f"arguments {args} and {kwargs}. "
                     f"Error: {e}"
                 )
             finally:
+                _replay_record_tool(
+                    func=self.func,
+                    args=args,
+                    kwargs=kwargs,
+                    result=result,
+                    error=error,
+                    started_at_ns=replay_t0,
+                    ended_at_ns=_time.time_ns(),
+                )
                 if t0 is not None:
                     _step3_log_tool(t0, _time.time(), self.func, ok)
 
@@ -452,7 +464,10 @@ class FunctionTool:
             result = self.synthesize_execution_output(args, kwargs)
             return result
         t0 = _time.time() if _step3_enabled() else None
+        replay_t0 = _time.time_ns()
         ok = False
+        result = None
+        error = None
         try:
             if self.is_async:
                 result = await self.func(*args, **kwargs)
@@ -460,7 +475,19 @@ class FunctionTool:
                 result = self.func(*args, **kwargs)
             ok = True
             return result
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
         finally:
+            _replay_record_tool(
+                func=self.func,
+                args=args,
+                kwargs=kwargs,
+                result=result,
+                error=error,
+                started_at_ns=replay_t0,
+                ended_at_ns=_time.time_ns(),
+            )
             if t0 is not None:
                 _step3_log_tool(t0, _time.time(), self.func, ok)
 

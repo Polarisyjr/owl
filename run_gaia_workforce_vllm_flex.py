@@ -33,14 +33,15 @@ and auto-discovers the served model name via /v1/models.
 """
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import random
 import shutil
+import signal
 import threading
 import time
-import signal
-from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -183,13 +184,15 @@ def make_model(role: str, **extra_config):
     model_type = _discover_model_name(ep.url, ep.api_key)
     cfg: Dict[str, Any] = {"temperature": 0.5, **ep.extra_config, **extra_config}
     logger.info(f"[vLLM] role={role:<18s} url={ep.url:<32s} model={model_type}")
-    return ModelFactory.create(
+    model = ModelFactory.create(
         model_platform=ModelPlatformType.VLLM,
         model_type=model_type,
         model_config_dict=cfg,
         url=ep.url,
         api_key=ep.api_key,
     )
+    model._agent_replay_role = role
+    return model
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -305,6 +308,7 @@ Here are some tips that help you perform web search:
             FunctionTool(video_analysis_toolkit.ask_question_about_video),
         ],
     )
+    web_agent._agent_replay_actor_id = "web"
 
     document_processing_agent = OwlWorkforceChatAgent(
         "You are a helpful assistant that can process documents and multimodal data, such as images, audio, and video.",
@@ -318,6 +322,7 @@ Here are some tips that help you perform web search:
             FunctionTool(code_runner_toolkit.execute_code),
         ],
     )
+    document_processing_agent._agent_replay_actor_id = "document"
 
     reasoning_coding_agent = OwlWorkforceChatAgent(
         "You are a helpful assistant that specializes in reasoning and coding, and can think step by step to solve the task. When necessary, you can write python code to solve the task. If you have written code, do not forget to execute the code. Never generate codes like 'example code', your code should be able to fully solve the task. You can also leverage multiple libraries, such as requests, BeautifulSoup, re, pandas, etc, to solve the task. For processing excel files, you should write codes to process them.",
@@ -329,6 +334,7 @@ Here are some tips that help you perform web search:
             FunctionTool(document_processing_toolkit.extract_document_content),
         ],
     )
+    reasoning_coding_agent._agent_replay_actor_id = "reasoning"
 
     return [
         {
@@ -436,7 +442,7 @@ def _proc_init(data_dir: str, save_to: str) -> None:
     logger.info(f"[worker pid={_proc_worker_id}] initialized")
 
 
-def _proc_run_one(
+def _proc_run_one_impl(
     task: Dict[str, Any],
     max_tries: int,
     max_replanning_tries: int,
@@ -492,7 +498,7 @@ def _proc_run_one(
             )
             score = bench.question_scorer(answer, task["Final answer"])
             logger.info(f"Score: {score}")
-            success = score == True
+            success = bool(score)
             trajectory_with_retry.append({
                 "attempts": tries,
                 "model_answer": answer,
@@ -553,7 +559,26 @@ def _proc_run_one(
             if _task_to > 0:
                 signal.alarm(0)   # disarm before next attempt / return
 
+    capture_dir = os.environ.get("AGENT_REPLAY_OWL_CAPTURE_DIR")
+    if capture_dir and final_result is not None:
+        result_path = Path(capture_dir) / f"task-result.{task['task_id']}.json"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = result_path.with_suffix(f"{result_path.suffix}.tmp.{os.getpid()}")
+        temporary.write_text(json.dumps(final_result, default=str, indent=2) + "\n")
+        os.replace(temporary, result_path)
     return final_result
+
+
+def _proc_run_one(
+    task: Dict[str, Any],
+    max_tries: int,
+    max_replanning_tries: int,
+) -> Optional[Dict[str, Any]]:
+    os.environ["AGENT_REPLAY_OWL_TASK_ID"] = str(task["task_id"])
+    try:
+        return _proc_run_one_impl(task, max_tries, max_replanning_tries)
+    finally:
+        os.environ.pop("AGENT_REPLAY_OWL_TASK_ID", None)
 
 
 def _run_gaia_parallel(
@@ -911,7 +936,7 @@ def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
             wall_s=steady_wall_s,
             subset=subset,
         )
-    elif max_workers <= 1:
+    elif max_workers <= 1 and not os.environ.get("AGENT_REPLAY_OWL_CAPTURE_DIR"):
         workforce = construct_workforce(worker_id=0)
         result = benchmark.run_workforce_with_retry(
             workforce,
