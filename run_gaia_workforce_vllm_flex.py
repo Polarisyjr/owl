@@ -680,10 +680,28 @@ def _run_gaia_steady(
     correct = total = 0
     seen: Dict[str, Any] = {}   # first result per task_id, saved for review
     last_log = time.monotonic()
+    events_path = os.environ.get("GAIA_QUEUE_EVENTS_PATH")
+    refill_count = 0
+
+    def queue_event(kind: str, **fields: Any) -> None:
+        if not events_path:
+            return
+        record = {
+            "event": kind,
+            "ts_epoch": time.time(),
+            "target_concurrency": max_workers,
+            **fields,
+        }
+        path = Path(events_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, sort_keys=True) + "\n")
+
     logger.info(
         f"[steady] pinning {max_workers} concurrent workforce(s) over "
         f"{len(tasks)} sampled task(s) (cycled) for {wall_s:.0f}s"
     )
+    queue_event("queue_start", running=0, duration_s=wall_s)
     with ProcessPoolExecutor(
         max_workers=max_workers,
         mp_context=ctx,
@@ -692,6 +710,7 @@ def _run_gaia_steady(
     ) as ex:
         inflight = {ex.submit(_proc_run_one, next(queue), max_tries, max_replanning_tries)
                     for _ in range(max_workers)}
+        queue_event("queue_filled", running=len(inflight), refill_count=refill_count)
         while inflight:
             done, inflight = wait(inflight, timeout=10, return_when=FIRST_COMPLETED)
             refill = time.monotonic() < deadline
@@ -711,14 +730,25 @@ def _run_gaia_steady(
                                 list(seen.values()), benchmark.save_to)
                 except Exception as e:
                     logger.error(f"[steady] worker exception: {e}")
+                queue_event("task_end", running=len(inflight), refill_count=refill_count)
                 if refill:
                     inflight.add(ex.submit(_proc_run_one, next(queue),
                                            max_tries, max_replanning_tries))
+                    refill_count += 1
+                    queue_event("refill", running=len(inflight), refill_count=refill_count)
             if time.monotonic() - last_log >= 30:
                 phase = "filling" if refill else "draining"
                 logger.info(f"[steady] {phase}: {len(inflight)} in-flight, "
                             f"{total} task-runs done ({correct} correct)")
+                queue_event(
+                    "heartbeat",
+                    running=len(inflight),
+                    refill_count=refill_count,
+                    phase=phase,
+                    completed=total,
+                )
                 last_log = time.monotonic()
+    queue_event("queue_stop", running=0, refill_count=refill_count, completed=total)
     acc = correct / total if total else 0.0
     logger.success(f"[steady] done: {total} task-runs, {correct} correct, acc={acc:.3f}")
     return {"correct": correct, "total": total, "accuracy": acc}
