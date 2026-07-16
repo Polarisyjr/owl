@@ -1468,7 +1468,17 @@ class ChatAgent(BaseAgent):
         func_name = tool_call_request.tool_name
         args = tool_call_request.args
         tool_call_id = tool_call_request.tool_call_id
-        tool = self._internal_tools[func_name]
+        tool = self._internal_tools.get(func_name)
+        if tool is None:
+            available = ", ".join(sorted(self._internal_tools)) or "<none>"
+            error_msg = (
+                f"Tool '{func_name}' is not available to this agent. "
+                f"Available tools: {available}"
+            )
+            logging.warning(error_msg)
+            return self._record_tool_calling(
+                func_name, args, {"error": error_msg}, tool_call_id
+            )
         from camel.utils.replay_capture import reset_tool_context, set_tool_context
 
         capture = func_name != self.__class__.Constants.FUNC_NAME_FOR_STRUCTURE_OUTPUT
@@ -1495,7 +1505,17 @@ class ChatAgent(BaseAgent):
         func_name = tool_call_request.tool_name
         args = tool_call_request.args
         tool_call_id = tool_call_request.tool_call_id
-        tool = self._internal_tools[func_name]
+        tool = self._internal_tools.get(func_name)
+        if tool is None:
+            available = ", ".join(sorted(self._internal_tools)) or "<none>"
+            error_msg = (
+                f"Tool '{func_name}' is not available to this agent. "
+                f"Available tools: {available}"
+            )
+            logging.warning(error_msg)
+            return self._record_tool_calling(
+                func_name, args, {"error": error_msg}, tool_call_id
+            )
         from camel.utils.replay_capture import reset_tool_context, set_tool_context
 
         capture = func_name != self.__class__.Constants.FUNC_NAME_FOR_STRUCTURE_OUTPUT

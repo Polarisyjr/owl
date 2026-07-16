@@ -541,7 +541,12 @@ class Workforce(BaseNode):
         by its parent node.
         """
         for child in self._children:
-            child.stop()
+            # A child coroutine can already have stopped after raising from a
+            # tool call.  Worker.stop() deliberately rejects a second stop,
+            # so calling it unconditionally leaves this workforce half-stopped
+            # and poisons every later task when the process reuses it.
+            if child._running:
+                child.stop()
         for child_task in self._child_listening_tasks:
             child_task.cancel()
         self._running = False

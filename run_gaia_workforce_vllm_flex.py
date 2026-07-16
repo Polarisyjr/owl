@@ -39,6 +39,7 @@ import os
 import random
 import shutil
 import signal
+import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
@@ -575,8 +576,19 @@ def _proc_run_one(
     max_replanning_tries: int,
 ) -> Optional[Dict[str, Any]]:
     os.environ["AGENT_REPLAY_OWL_TASK_ID"] = str(task["task_id"])
+    original_cwd = os.getcwd()
     try:
-        return _proc_run_one_impl(task, max_tries, max_replanning_tries)
+        # Model-generated execute_code snippets frequently create relative-path
+        # scratch files.  Keep those files available across all tool calls for
+        # this task, but isolate concurrent tasks and remove their scratch data
+        # when the task ends instead of polluting frameworks/owl.
+        task_prefix = str(task["task_id"]).replace(os.sep, "_")[:16]
+        with tempfile.TemporaryDirectory(prefix=f"owl-gaia-{task_prefix}-") as workdir:
+            os.chdir(workdir)
+            try:
+                return _proc_run_one_impl(task, max_tries, max_replanning_tries)
+            finally:
+                os.chdir(original_cwd)
     finally:
         os.environ.pop("AGENT_REPLAY_OWL_TASK_ID", None)
 
