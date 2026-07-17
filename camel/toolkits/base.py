@@ -37,7 +37,18 @@ class BaseToolkit(metaclass=AgentOpsMeta):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         for attr_name, attr_value in cls.__dict__.items():
-            if callable(attr_value) and not attr_name.startswith("__"):
+            if attr_name.startswith("__"):
+                continue
+            # staticmethod objects are callable on Python >= 3.10, so they
+            # reach the callable() branch and come back out as plain
+            # functions -- rewrap to keep the descriptor.
+            if isinstance(attr_value, staticmethod):
+                setattr(
+                    cls,
+                    attr_name,
+                    staticmethod(with_timeout(attr_value.__func__)),
+                )
+            elif callable(attr_value):
                 setattr(cls, attr_name, with_timeout(attr_value))
 
     def get_tools(self) -> List[FunctionTool]:

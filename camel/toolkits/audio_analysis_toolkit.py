@@ -71,14 +71,22 @@ class AudioAnalysisToolkit(BaseToolkit):
                     "faster-whisper is required for local audio transcription. "
                     "Install with: pip install faster-whisper"
                 ) from e
+            # faster-whisper runs on CTranslate2, not torch, so probe CT2 for
+            # usable GPUs. torch.cuda can be unavailable (e.g. a cu130 build on
+            # a CUDA 12.6 driver) while CT2's own runtime drives the same GPUs
+            # fine -- probing torch here silently demotes whisper to CPU.
             try:
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+                import ctranslate2
+                device = (
+                    "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+                )
             except ImportError:
                 device = "cpu"
             compute_type = "float16" if device == "cuda" else "int8"
             kwargs = dict(device=device, compute_type=compute_type)
-            if self._whisper_device_index is not None:
+            # device_index is CUDA-only; passing it on CPU raises
+            # "Invalid CPU device index".
+            if device == "cuda" and self._whisper_device_index is not None:
                 kwargs["device_index"] = self._whisper_device_index
             logger.info(
                 f"Loading faster-whisper {self._whisper_model_size} on {device} "

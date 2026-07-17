@@ -13,6 +13,7 @@
 # ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import List
@@ -89,23 +90,40 @@ class Worker(BaseNode, ABC):
         while True:
             # Get the earliest task assigned to this node
             task = await self._get_assigned_task()
-            print(
-                f"{Fore.YELLOW}{self} get task {task.id}: {task.content}"
-                f"{Fore.RESET}"
-            )
-            # Get the Task instance of dependencies
-            dependency_ids = await self._channel.get_dependency_ids()
-            task_dependencies = [
-                await self._channel.get_task_by_id(dep_id)
-                for dep_id in dependency_ids
-            ]
+            try:
+                print(
+                    f"{Fore.YELLOW}{self} get task {task.id}: "
+                    f"{task.content}{Fore.RESET}"
+                )
+                # Get the Task instance of dependencies
+                dependency_ids = await self._channel.get_dependency_ids()
+                task_dependencies = [
+                    await self._channel.get_task_by_id(dep_id)
+                    for dep_id in dependency_ids
+                ]
 
-            # Process the task
-            task_state = await self._process_task(task, task_dependencies)
+                # Process the task
+                task_state = await self._process_task(
+                    task, task_dependencies
+                )
+            except asyncio.CancelledError:
+                # Workforce.stop() cancels listeners intentionally. Do not
+                # turn shutdown into a synthetic failed task.
+                raise
+            except Exception as exc:
+                # A worker must always return an acquired task. Otherwise the
+                # publisher waits on TaskChannel forever (for example when a
+                # structured response fails pydantic validation).
+                logger.exception(
+                    "%s failed while processing task %s", self, task.id
+                )
+                task.failure_reason = f"{type(exc).__name__}: {exc}"
+                task.result = task.failure_reason
+                task_state = TaskState.FAILED
 
-            # Update the result and status of the task
+            # Update the result and status of the task, then return it even
+            # when processing or response parsing failed.
             task.set_state(task_state)
-
             await self._channel.return_task(task.id)
 
     @check_if_running(False)

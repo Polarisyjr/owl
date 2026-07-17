@@ -397,7 +397,7 @@ Please output with the final answer according to the requirements without any ot
         agent: ChatAgent,
         on: Literal["valid", "test"],
         level: Union[int, List[int], Literal["all"]],
-        max_tries: int = 3,
+        max_tries: int = 1,
         randomize: bool = False,
         subset: Optional[int] = None,
         idx: Optional[List[int]] = None,
@@ -496,7 +496,7 @@ Please output with the final answer according to the requirements without any ot
         workforce: Workforce,  
         on: Literal["valid", "test"],
         level: Union[int, List[int], Literal["all"]],
-        max_tries: int = 3,
+        max_tries: int = 1,
         max_replanning_tries: int = 2,
         randomize: bool = False,
         subset: Optional[int] = None,
@@ -507,10 +507,10 @@ Please output with the final answer according to the requirements without any ot
 
         Args:
             workforce (Workforce): The workforce to use for task processing.
-            max_tries (int): Maximum number of retries per task. Defaults to 3.
+            max_tries (int): Maximum number of attempts per task. Defaults to 1.
             on (Literal["valid", "test"]): Which dataset split to run on.
             level (Union[int, List[int], Literal["all"]]): Which difficulty levels to run.
-            max_tries (int): Maximum number of retries per task. Defaults to 3.
+            max_tries (int): Maximum number of attempts per task. Defaults to 1.
             max_replanning_tries (int): Maximum number of replanning tries. Defaults to 2.
             randomize (bool): Whether to randomize task order. Defaults to False.
             subset (Optional[int]): Number of tasks to run. Defaults to None (all tasks).

@@ -37,8 +37,10 @@ logger = logging.getLogger(__name__)
 
 
 # --- step3 tool-attribution lane (opt-in via env) --------------------------
-# When STEP3_TOOL_LOG points at a file, every tool execution appends one JSONL
-# record {ts_start, ts_end, tool, chain, pid, success} there. This is the owl
+# When STEP3_TOOL_LOG points at a file, every tool execution appends start/end
+# JSONL records carrying {call_id, ts_start, ts_end, tool, chain, task_id, ...}.
+# Start records let the harvester retain a tool interrupted by a task timeout.
+# This is the owl
 # analog of trae's option-A test-run instrumentation: FunctionTool.__call__ /
 # .async_call are the single choke point every toolkit call passes through, so
 # the whole GAIA workforce's off-GPU tool work becomes a timeline lane without
@@ -48,26 +50,78 @@ def _step3_tool_name(func: Callable) -> str:
 
 
 def _step3_tool_chain(func: Callable) -> str:
-    r"""Lane label: '<pid>/<ToolkitClass>' — pid separates concurrent GAIA tasks
-    (each runs in its own ProcessPoolExecutor worker), the toolkit class is a
-    good proxy for the worker role (BrowserToolkit->web, ...)."""
+    r"""Lane label: '<task-id>/<ToolkitClass>' with a pid fallback.
+
+    A ProcessPoolExecutor worker can execute several GAIA tasks over its lifetime,
+    so pid alone is not a stable task identity.  The runner updates OWL_T2T_TASK
+    before each task; use it for both the LLM and tool sidecars so parallel Step3
+    data can be joined without guessing from overlapping timestamps.
+    """
     owner = getattr(func, "__self__", None)
     cls = type(owner).__name__ if owner is not None else "func"
-    return f"{_os.getpid()}/{cls}"
+    task_id = _os.environ.get("OWL_T2T_TASK") or _os.environ.get(
+        "AGENT_REPLAY_OWL_TASK_ID"
+    )
+    return f"{task_id or _os.getpid()}/{cls}"
 
 
-def _step3_log_tool(t0: float, t1: float, func: Callable, ok: bool) -> None:
+def _step3_tool_record(func: Callable) -> Dict[str, Any]:
+    task_id = _os.environ.get("OWL_T2T_TASK") or _os.environ.get(
+        "AGENT_REPLAY_OWL_TASK_ID"
+    )
+    return {
+        "tool": _step3_tool_name(func),
+        "chain": _step3_tool_chain(func),
+        "task_id": task_id,
+        "pid": _os.getpid(),
+    }
+
+
+def _step3_append_tool_record(record: Dict[str, Any]) -> None:
     path = _os.environ.get("STEP3_TOOL_LOG")
     if not path:
         return
     try:
-        rec = {"ts_start": round(t0, 3), "ts_end": round(t1, 3),
-               "tool": _step3_tool_name(func), "chain": _step3_tool_chain(func),
-               "pid": _os.getpid(), "success": ok}
         with open(path, "a") as f:
-            f.write(_json.dumps(rec) + "\n")
+            f.write(_json.dumps(record) + "\n")
     except Exception:
         pass  # never let instrumentation break a run
+
+
+def _step3_log_tool_start(
+    t0: float, func: Callable, call_id: str
+) -> None:
+    rec = _step3_tool_record(func)
+    rec.update(
+        {
+            "call_id": call_id,
+            "phase": "start",
+            "ts_start": round(t0, 3),
+            "ts_end": None,
+            "success": None,
+        }
+    )
+    _step3_append_tool_record(rec)
+
+
+def _step3_log_tool(
+    t0: float,
+    t1: float,
+    func: Callable,
+    ok: bool,
+    call_id: str,
+) -> None:
+    rec = _step3_tool_record(func)
+    rec.update(
+        {
+            "call_id": call_id,
+            "phase": "end",
+            "ts_start": round(t0, 3),
+            "ts_end": round(t1, 3),
+            "success": ok,
+        }
+    )
+    _step3_append_tool_record(rec)
 
 
 def _step3_enabled() -> bool:
@@ -432,6 +486,9 @@ class FunctionTool:
             # Pass the extracted arguments to the indicated function
             t0 = _time.time() if _step3_enabled() else None
             replay_t0 = _time.time_ns()
+            call_id = f"{_os.getpid()}-{replay_t0}"
+            if t0 is not None:
+                _step3_log_tool_start(t0, self.func, call_id)
             ok = False
             result = None
             error = None
@@ -457,7 +514,9 @@ class FunctionTool:
                     ended_at_ns=_time.time_ns(),
                 )
                 if t0 is not None:
-                    _step3_log_tool(t0, _time.time(), self.func, ok)
+                    _step3_log_tool(
+                        t0, _time.time(), self.func, ok, call_id
+                    )
 
     async def async_call(self, *args: Any, **kwargs: Any) -> Any:
         if self.synthesize_output:
@@ -465,6 +524,9 @@ class FunctionTool:
             return result
         t0 = _time.time() if _step3_enabled() else None
         replay_t0 = _time.time_ns()
+        call_id = f"{_os.getpid()}-{replay_t0}"
+        if t0 is not None:
+            _step3_log_tool_start(t0, self.func, call_id)
         ok = False
         result = None
         error = None
@@ -489,7 +551,9 @@ class FunctionTool:
                 ended_at_ns=_time.time_ns(),
             )
             if t0 is not None:
-                _step3_log_tool(t0, _time.time(), self.func, ok)
+                _step3_log_tool(
+                    t0, _time.time(), self.func, ok, call_id
+                )
 
     @property
     def is_async(self) -> bool:

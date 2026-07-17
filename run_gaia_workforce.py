@@ -212,7 +212,7 @@ def evaluate_on_gaia():
     LEVEL = 1
     on="valid"
     SAVE_RESULT = True
-    MAX_TRIES = 3
+    MAX_TRIES = 1
     
     SAVE_RESULT_PATH = f"results/workforce/workforce_{LEVEL}_pass{MAX_TRIES}_gpt4o.json"
     test_idx = [1]
@@ -243,4 +243,3 @@ def evaluate_on_gaia():
 
 if __name__ == "__main__":
     evaluate_on_gaia()
-

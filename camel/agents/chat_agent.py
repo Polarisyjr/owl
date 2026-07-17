@@ -153,6 +153,11 @@ class ChatAgent(BaseAgent):
 
     class Constants:
         FUNC_NAME_FOR_STRUCTURE_OUTPUT: str = "return_json_response"
+        # A model can ignore the structured-output tool and answer with plain
+        # text.  The old unbounded hint loop then appended the same request
+        # forever (and grew the prompt on every iteration).  Keep a small,
+        # deterministic bound before falling back to direct JSON formatting.
+        MAX_STRUCTURED_OUTPUT_MISSES: int = 3
 
     def __init__(
         self,
@@ -517,6 +522,19 @@ class ChatAgent(BaseAgent):
         except ValidationError:
             return False
 
+    def _has_valid_structured_content(
+        self,
+        response: ModelResponse,
+        response_format: Type[BaseModel],
+    ) -> bool:
+        r"""Accept valid JSON content even when the model omitted the
+        synthetic ``return_json_response`` tool call."""
+        return any(
+            bool(message.content)
+            and self._try_format_message(message, response_format)
+            for message in response.output_messages
+        )
+
     def _format_response_if_needed(
         self,
         response: ModelResponse,
@@ -631,6 +649,7 @@ class ChatAgent(BaseAgent):
 
         tool_call_records: List[ToolCallingRecord] = []
         external_tool_call_requests: Optional[List[ToolCallRequest]] = None
+        structured_output_misses = 0
 
         # If tool_call_based_structured_output is True and we have a
         # response_format, add the output schema as a special tool
@@ -707,6 +726,32 @@ class ChatAgent(BaseAgent):
                 not any(record.tool_name == self.__class__.Constants.FUNC_NAME_FOR_STRUCTURE_OUTPUT
                         for record in tool_call_records) and
                 not self.single_iteration):
+                # Some models emit valid JSON directly instead of invoking the
+                # synthetic schema tool.  Accept it rather than needlessly
+                # nudging the model again.
+                if self._has_valid_structured_content(
+                    response, response_format
+                ):
+                    break
+
+                structured_output_misses += 1
+                if (
+                    structured_output_misses
+                    >= self.__class__.Constants.MAX_STRUCTURED_OUTPUT_MISSES
+                ):
+                    # One bounded, tool-free formatting attempt.  If it still
+                    # cannot satisfy the schema, fail explicitly so the caller
+                    # can retry/replan the task instead of spinning forever.
+                    self._format_response_if_needed(response, response_format)
+                    if self._has_valid_structured_content(
+                        response, response_format
+                    ):
+                        break
+                    raise ModelProcessingError(
+                        "Model did not produce structured output after "
+                        f"{structured_output_misses} requests for "
+                        f"{response_format.__name__}."
+                    )
                 # add information to inform agent that it should use tool to structure the output
                 hint_message = BaseMessage.make_user_message(
                     role_name="User",
@@ -822,6 +867,7 @@ class ChatAgent(BaseAgent):
 
         tool_call_records: List[ToolCallingRecord] = []
         external_tool_call_requests: Optional[List[ToolCallRequest]] = None
+        structured_output_misses = 0
 
         if tool_call_based_structured_output and response_format:
             # Extract the schema from the response format and create a function
@@ -883,6 +929,11 @@ class ChatAgent(BaseAgent):
                         if not self.single_iteration:
                             continue
 
+                    # The structured-output call has been executed; do not
+                    # make the extra model request that the old unconditional
+                    # continue below caused.
+                    break
+
                 # If we're still here, continue the loop
                 continue
             
@@ -892,6 +943,28 @@ class ChatAgent(BaseAgent):
                 not any(record.tool_name == self.__class__.Constants.FUNC_NAME_FOR_STRUCTURE_OUTPUT
                         for record in tool_call_records) and
                 not self.single_iteration):
+                if self._has_valid_structured_content(
+                    response, response_format
+                ):
+                    break
+
+                structured_output_misses += 1
+                if (
+                    structured_output_misses
+                    >= self.__class__.Constants.MAX_STRUCTURED_OUTPUT_MISSES
+                ):
+                    await self._aformat_response_if_needed(
+                        response, response_format
+                    )
+                    if self._has_valid_structured_content(
+                        response, response_format
+                    ):
+                        break
+                    raise ModelProcessingError(
+                        "Model did not produce structured output after "
+                        f"{structured_output_misses} requests for "
+                        f"{response_format.__name__}."
+                    )
                 # add information to inform agent that it should use tool to structure the output
                 hint_message = BaseMessage.make_user_message(
                     role_name="User",

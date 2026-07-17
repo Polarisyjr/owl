@@ -3,6 +3,8 @@ from camel.prompts import TextPrompt
 import ast
 import asyncio
 import logging
+import os
+import time
 from collections import deque
 from typing import Deque, Dict, List, Optional
 
@@ -40,6 +42,10 @@ from typing import Tuple
 logger = logging.getLogger(__name__)
 
 
+class OwlWorkforceTaskTimeout(TimeoutError):
+    """The workforce exhausted the wall-clock budget for one GAIA task."""
+
+
 OWL_PROCESS_TASK_PROMPT = TextPrompt(
     """We are solving a complex task, and we have split the task into several subtasks.
     
@@ -72,8 +78,46 @@ Now please fully leverage the information above, try your best to leverage the e
 If you need to write code, never generate code like "example code", your code should be completely runnable and able to fully solve the task. After writing the code, you must execute the code.
 If you are going to process local files, you should explicitly mention all the processed file path (especially extracted files in zip files) in your answer to let other workers know where to find the file.
 If you find the subtask is of no help to complete the overall task based on the information you collected, you should make the subtask failed, and return your suggestion for the next step. (e.g. you are asked to extract the content of the document, but the document is too long. It is better to write python code to process it)
+
+Your final response must be exactly one valid JSON object with this schema:
+{{"content": "the detailed subtask result or failure reason", "failed": false}}
+Set "failed" to true when the subtask could not be completed. Do not wrap the
+JSON in markdown and do not call a function merely to format this final object.
 """
 )
+
+
+def _parse_task_result(content: Any) -> TaskResult:
+    """Parse a worker's prompt-based TaskResult without trusting one format."""
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("worker returned an empty task result")
+
+    raw = content.strip()
+    candidates = [raw]
+    if raw.startswith("```") and raw.endswith("```"):
+        first_newline = raw.find("\n")
+        if first_newline >= 0:
+            candidates.append(raw[first_newline + 1 : -3].strip())
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
+    if 0 <= first_brace < last_brace:
+        candidates.append(raw[first_brace : last_brace + 1])
+
+    errors: List[str] = []
+    for candidate in dict.fromkeys(candidates):
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                value = parser(candidate)
+                if not isinstance(value, dict):
+                    raise TypeError("task result is not an object")
+                return TaskResult(**value)
+            except Exception as exc:
+                errors.append(f"{parser.__name__}: {exc}")
+
+    raise ValueError(
+        "worker did not return a valid TaskResult JSON object: "
+        + "; ".join(errors[-2:])
+    )
 
 
 OWL_WF_TASK_DECOMPOSE_PROMPT = r"""You need to split the given task into 
@@ -217,22 +261,24 @@ class OwlSingleAgentWorker(SingleAgentWorker):
             additional_info=task.additional_info,
         )
         try:
-            response = await self.worker.astep(prompt, response_format=TaskResult)
-
+            # Prompt-based JSON avoids the synthetic return_json_response tool.
+            # Some models supplied fields that were not in that tool's schema;
+            # the tool then returned an error object which used to crash parsing
+            # after the worker had already acquired the task.
+            response = await self.worker.astep(prompt)
+            task_result = _parse_task_result(response.msg.content)
         except Exception as e:
             print(
                 f"{Fore.RED}Error occurred while processing task {task.id}:"
                 f"\n{e}{Fore.RESET}"
             )
-            
+            task.failure_reason = f"{type(e).__name__}: {e}"
+            task.result = task.failure_reason
             task.history = self._get_trajectory(task)
+            task.assignee = self.name
             return TaskState.FAILED
 
         print(f"======\n{Fore.GREEN}Reply from {self}:{Fore.RESET}")
-        # if len(response.msg.content) == 0:
-        #     return TaskState.FAILED
-        result_dict = ast.literal_eval(response.msg.content)
-        task_result = TaskResult(**result_dict)
 
         color = Fore.RED if task_result.failed else Fore.GREEN
         print_text_animated(
@@ -245,8 +291,10 @@ class OwlSingleAgentWorker(SingleAgentWorker):
         task.assignee = self.name
 
         if task_result.failed:
+            task.failure_reason = task_result.content
             return TaskState.FAILED
 
+        task.failure_reason = None
         return TaskState.DONE
 
 
@@ -267,6 +315,12 @@ class OwlWorkforce(Workforce):
         self.failure_count: int = 0
         self.failure_info: List[str] = []
         self.task_failed: bool = False
+        timeout_value = os.environ.get(
+            "OWL_WORKFORCE_TASK_TIMEOUT_S",
+            os.environ.get("GAIA_TASK_TIMEOUT_S", "600"),
+        )
+        self.task_return_timeout_s = float(timeout_value or "0")
+        self._task_deadline: Optional[float] = None
         
         
     def add_single_agent_worker(
@@ -335,6 +389,11 @@ class OwlWorkforce(Workforce):
         self.failure_count = 0
         self.failure_info = []
         self.task_failed = False
+        self._task_deadline = (
+            time.monotonic() + self.task_return_timeout_s
+            if self.task_return_timeout_s > 0
+            else None
+        )
         
         if len(task.overall_task) == 0:
             task.overall_task = task.content
@@ -402,23 +461,117 @@ the above task processing failed for the following reasons (responded by an agen
         Returns:
             str: ID of the worker node to be assigned.
         """
-        prompt = ASSIGN_TASK_PROMPT.format(
+        valid_ids = {str(child.node_id) for child in self._children}
+        if not valid_ids:
+            raise RuntimeError("cannot assign a task without worker nodes")
+
+        base_prompt = ASSIGN_TASK_PROMPT.format(
             content=task.content,
             child_nodes_info=self._get_child_nodes_info(),
             additional_info=task.additional_info,
         )
-        req = BaseMessage.make_user_message(
-            role_name="User",
-            content=prompt,
-        )
+        invalid_feedback = ""
+        for attempt in range(1, 4):
+            self.coordinator_agent.reset()
+            req = BaseMessage.make_user_message(
+                role_name="User",
+                content=base_prompt + invalid_feedback,
+            )
+            try:
+                response = self.coordinator_agent.step(
+                    req, response_format=TaskAssignResult
+                )
+                parsed = getattr(response.msg, "parsed", None)
+                if isinstance(parsed, TaskAssignResult):
+                    task_assign_result = parsed
+                else:
+                    try:
+                        result_dict = json.loads(response.msg.content)
+                    except (json.JSONDecodeError, TypeError):
+                        result_dict = ast.literal_eval(response.msg.content)
+                    task_assign_result = TaskAssignResult(**result_dict)
 
-        response = self.coordinator_agent.step(
-            req, response_format=TaskAssignResult
+                assignee_id = task_assign_result.assignee_id.strip("<> \t\r\n")
+                if assignee_id in valid_ids:
+                    task.assignee_id = assignee_id
+                    return assignee_id
+                problem = f"unknown worker id {assignee_id!r}"
+            except Exception as exc:
+                problem = f"{type(exc).__name__}: {exc}"
+
+            logger.warning(
+                "Coordinator assignment attempt %d/3 failed for task %s: %s",
+                attempt,
+                task.id,
+                problem,
+            )
+            invalid_feedback = (
+                "\n\nYour previous assignment was invalid. Return exactly one "
+                f"assignee_id from this allowlist: {sorted(valid_ids)}."
+            )
+
+        # Existing workers are already configured with the correct vLLM role
+        # routing. Creating an upstream-style ad-hoc worker here would bypass
+        # that routing, so use a deterministic valid worker as the last resort.
+        assignee_id = str(self._children[0].node_id)
+        logger.error(
+            "Coordinator could not produce a valid assignee for task %s; "
+            "falling back to worker %s",
+            task.id,
+            assignee_id,
         )
-        result_dict = ast.literal_eval(response.msg.content)
-        task_assign_result = TaskAssignResult(**result_dict)
-        task.assignee_id = task_assign_result.assignee_id
-        return task_assign_result.assignee_id
+        task.assignee_id = assignee_id
+        return assignee_id
+
+    async def _post_task(self, task: Task, assignee_id: str) -> None:
+        valid_ids = {str(child.node_id) for child in self._children}
+        if assignee_id not in valid_ids:
+            if not self._children:
+                raise RuntimeError("cannot post a task without worker nodes")
+            fallback_id = str(self._children[0].node_id)
+            logger.error(
+                "Refusing invalid assignee %r for task %s; using %s",
+                assignee_id,
+                task.id,
+                fallback_id,
+            )
+            assignee_id = fallback_id
+            task.assignee_id = fallback_id
+        await super()._post_task(task, assignee_id)
+
+    async def _get_returned_task(self) -> Task:
+        timeout_s = self.task_return_timeout_s
+        deadline = getattr(self, "_task_deadline", None)
+        if deadline is not None:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                logger.error(
+                    "Workforce %s exhausted its total %.1fs task deadline",
+                    self.node_id,
+                    self.task_return_timeout_s,
+                )
+                raise OwlWorkforceTaskTimeout
+            timeout_s = (
+                min(timeout_s, remaining_s)
+                if timeout_s > 0
+                else remaining_s
+            )
+
+        if timeout_s <= 0:
+            return await super()._get_returned_task()
+        try:
+            return await asyncio.wait_for(
+                super()._get_returned_task(),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            logger.error(
+                "Workforce %s received no returned task before its %.1fs "
+                "deadline; aborting this attempt instead of waiting forever",
+                self.node_id,
+                self.task_return_timeout_s,
+            )
+            raise OwlWorkforceTaskTimeout from exc
 
 
     async def _post_ready_tasks(self) -> None:
@@ -584,6 +737,11 @@ Please output with the final answer according to the requirements without any ot
         self.failure_info = []
         self.overall_task_solve_trajectory = []
         self.task_failed = False
+        self._task_deadline = (
+            time.monotonic() + self.task_return_timeout_s
+            if self.task_return_timeout_s > 0
+            else None
+        )
         
         if len(task.overall_task) == 0:
             task.overall_task = task.content
@@ -611,4 +769,3 @@ Please output with the final answer according to the requirements without any ot
 
         logger.info(f"The task {task.id} has been solved.")
         return task
-        

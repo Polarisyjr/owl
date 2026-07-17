@@ -67,7 +67,11 @@ from camel.toolkits import (
 from camel.tasks import Task
 from camel.types import ModelPlatformType
 
-from utils import OwlGaiaWorkforce, OwlWorkforceChatAgent
+from utils import (
+    OwlGaiaWorkforce,
+    OwlWorkforceChatAgent,
+    OwlWorkforceTaskTimeout,
+)
 from utils.gaia import GAIABenchmark
 
 load_dotenv(override=True)
@@ -415,11 +419,17 @@ _proc_benchmark: Optional[GAIABenchmark] = None
 _proc_worker_id: Optional[int] = None
 
 
-class _TaskTimeout(Exception):
+class _TaskTimeout(BaseException):
     """Raised in a worker's main thread by SIGALRM when a single GAIA task
     exceeds its wall-clock budget (a task hung in a non-LLM tool op — e.g. a
     browser navigation/click — would otherwise occupy its concurrency slot
-    forever, so steady-mode can never refill it and the offered load decays)."""
+    forever, so steady-mode can never refill it and the offered load decays).
+
+    This intentionally derives from BaseException: toolkits commonly catch
+    ``Exception`` to replan after a browser/tool failure. A watchdog signal is
+    process-control flow, not a recoverable tool failure, and must reach the
+    runner's dedicated ``except _TaskTimeout`` block.
+    """
 
 
 def _task_alarm_handler(signum, frame):
@@ -466,6 +476,17 @@ def _proc_run_one_impl(
     trajectory_with_retry: List[dict] = []
     final_result: Optional[Dict[str, Any]] = None
     _task_to = int(os.environ.get("GAIA_TASK_TIMEOUT_S", "0") or "0")
+
+    # Keep the asynchronous Workforce deadline inside (or equal to) the
+    # runner's watchdog.  Previously an explicitly larger
+    # OWL_WORKFORCE_TASK_TIMEOUT_S could leave asyncio.run() cleaning up for
+    # tens of seconds after SIGALRM, so the ProcessPool slot was not released
+    # at the advertised GAIA_TASK_TIMEOUT_S boundary.
+    if _task_to > 0:
+        wf.task_return_timeout_s = min(
+            float(getattr(wf, "task_return_timeout_s", _task_to) or _task_to),
+            float(_task_to),
+        )
 
     while not success and tries < max_tries:
         tries += 1
@@ -519,7 +540,7 @@ def _proc_run_one_impl(
                     "attempts": tries,
                     "trajectory": trajectory_with_retry,
                 }
-        except _TaskTimeout:
+        except (_TaskTimeout, OwlWorkforceTaskTimeout):
             # hung task — abort this attempt, don't retry, free the slot so a
             # steady-mode refill can keep concurrency pinned.
             logger.error(
@@ -917,7 +938,7 @@ def _run_gaia_rps(
     return {"correct": correct, "total": total, "accuracy": acc}
 
 
-def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 3,
+def evaluate_on_gaia(level: int = 1, on: str = "valid", max_tries: int = 1,
                      test_idx: Optional[List[int]] = None,
                      save_result: bool = True,
                      max_workers: int = 1,
