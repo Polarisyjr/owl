@@ -112,6 +112,13 @@ class AudioAnalysisToolkit(BaseToolkit):
 
     def _transcribe_local(self, audio_path: str) -> str:
         """Transcribe audio with faster-whisper (free, local)."""
+        from camel.utils.replay_capture import record_unreplayable_model_call
+
+        record_unreplayable_model_call(
+            name="audio_transcription",
+            provider="faster-whisper",
+            details={"model": self._whisper_model_size},
+        )
         model = self._get_whisper()
         segments, _info = model.transcribe(audio_path, beam_size=5)
         return " ".join(seg.text.strip() for seg in segments)

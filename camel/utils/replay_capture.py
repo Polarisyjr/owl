@@ -10,10 +10,18 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
+
+from camel.utils.tool_contract import capture_outer_tool
+
+T = TypeVar("T")
 
 _actor = contextvars.ContextVar("agent_replay_owl_actor", default="unknown")
 _capture_tool = contextvars.ContextVar("agent_replay_owl_capture_tool", default=True)
+_tool_name = contextvars.ContextVar("agent_replay_owl_tool_name", default=None)
+_allow_nested_models = contextvars.ContextVar(
+    "agent_replay_owl_allow_nested_models", default=False
+)
 
 
 def _actor_id(value: Any) -> str:
@@ -21,14 +29,27 @@ def _actor_id(value: Any) -> str:
     return normalized or "unknown"
 
 
-def set_tool_context(actor: str, capture: bool = True):
-    return _actor.set(actor), _capture_tool.set(capture)
+def set_tool_context(
+    actor: str,
+    capture: bool = True,
+    *,
+    tool_name: str | None = None,
+    allow_nested_models: bool = False,
+):
+    return (
+        _actor.set(actor),
+        _capture_tool.set(capture),
+        _tool_name.set(tool_name),
+        _allow_nested_models.set(allow_nested_models),
+    )
 
 
 def reset_tool_context(tokens) -> None:
-    actor_token, capture_token = tokens
+    actor_token, capture_token, tool_name_token, allow_models_token = tokens
     _actor.reset(actor_token)
     _capture_tool.reset(capture_token)
+    _tool_name.reset(tool_name_token)
+    _allow_nested_models.reset(allow_models_token)
 
 
 def _capture_dir() -> Path | None:
@@ -69,6 +90,12 @@ def record_tool(
     if _capture_dir() is None or not _capture_tool.get():
         return
     owner = getattr(func, "__self__", None)
+    name = getattr(func, "__name__", repr(func))
+    # Orchestration and model capabilities remain valid FunctionTools for live
+    # Agent execution, but their outer calls are not replay tools. Their nested
+    # LLM requests and explicit model-free primitives are captured separately.
+    if not capture_outer_tool(name):
+        return
     append_record(
         {
             "kind": "function_tool.call",
@@ -76,9 +103,110 @@ def record_tool(
             "actor_id": _actor_id(_actor.get()),
             "toolkit": type(owner).__name__ if owner is not None else "function",
             "invocation": {
-                "name": getattr(func, "__name__", repr(func)),
+                "name": name,
                 "arguments": kwargs if not args else {"args": list(args), **kwargs},
             },
+            "status": "error" if error else "success",
+            "output": result,
+            "error": error,
+            "started_at_ns": started_at_ns,
+            "ended_at_ns": ended_at_ns,
+        }
+    )
+
+
+def run_tool_primitive(
+    *,
+    name: str,
+    arguments: dict[str, Any],
+    function: Callable[[], T],
+    toolkit: str,
+) -> T:
+    """Execute and capture one synchronous model-free replay primitive."""
+
+    if _capture_dir() is None or not _capture_tool.get():
+        return function()
+    started_at_ns = time.time_ns()
+    tool_token = _tool_name.set(name)
+    allow_token = _allow_nested_models.set(False)
+    result: Any = None
+    error: str | None = None
+    try:
+        result = function()
+        return result
+    except BaseException as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        _allow_nested_models.reset(allow_token)
+        _tool_name.reset(tool_token)
+        append_record(
+            {
+                "kind": "function_tool.call",
+                "capture_id": uuid.uuid4().hex,
+                "actor_id": _actor_id(_actor.get()),
+                "toolkit": toolkit,
+                "invocation": {"name": name, "arguments": arguments},
+                "status": "error" if error else "success",
+                "output": result,
+                "error": error,
+                "started_at_ns": started_at_ns,
+                "ended_at_ns": time.time_ns(),
+            }
+        )
+
+
+def record_unreplayable_model_call(
+    *, name: str, provider: str, details: dict[str, Any] | None = None
+) -> None:
+    """Fail-closed marker for model inference lacking an HTTP replay adapter."""
+
+    if _capture_dir() is None or not _capture_tool.get():
+        return
+    now = time.time_ns()
+    append_record(
+        {
+            "kind": "model.call.unreplayable",
+            "capture_id": uuid.uuid4().hex,
+            "actor_id": _actor_id(_actor.get()),
+            "model_call": {"name": name, "provider": provider, **(details or {})},
+            "started_at_ns": now,
+            "ended_at_ns": now,
+        }
+    )
+
+
+def record_browser_primitive(
+    *,
+    name: str,
+    arguments: dict[str, Any],
+    result: Any,
+    error: str | None,
+    started_at_ns: int,
+    ended_at_ns: int,
+    replayable: bool = True,
+) -> None:
+    """Record one model-free browser operation inside ``browse_url``.
+
+    Browser planning remains an ordinary captured LLM request.  Only explicit
+    operations whose complete input is present in ``arguments`` are admitted
+    as replay tools.  A model-backed browser action is emitted as an explicit
+    unsupported record so the recording builder fails closed.
+    """
+
+    if _capture_dir() is None or not _capture_tool.get():
+        return
+    append_record(
+        {
+            "kind": (
+                "function_tool.call"
+                if replayable
+                else "browser.primitive.unreplayable"
+            ),
+            "capture_id": uuid.uuid4().hex,
+            "actor_id": _actor_id(_actor.get()),
+            "toolkit": "AsyncBrowserPrimitive",
+            "invocation": {"name": name, "arguments": arguments},
             "status": "error" if error else "success",
             "output": result,
             "error": error,
@@ -97,6 +225,18 @@ class OpenAIReplayCapture:
             return
         capture_id = uuid.uuid4().hex
         started_at_ns = time.time_ns()
+        active_tool = _tool_name.get()
+        if active_tool and not _allow_nested_models.get():
+            append_record(
+                {
+                    "kind": "tool.model_call.violation",
+                    "capture_id": f"violation-{capture_id}",
+                    "actor_id": _actor_id(_actor.get()),
+                    "tool_name": active_tool,
+                    "started_at_ns": started_at_ns,
+                    "ended_at_ns": started_at_ns,
+                }
+            )
         body = bytes(request.content)
         request.extensions["agent_replay_capture_id"] = capture_id
         request.extensions["agent_replay_started_at_ns"] = started_at_ns

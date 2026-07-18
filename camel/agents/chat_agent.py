@@ -1553,11 +1553,14 @@ class ChatAgent(BaseAgent):
                 func_name, args, {"error": error_msg}, tool_call_id
             )
         from camel.utils.replay_capture import reset_tool_context, set_tool_context
+        from camel.utils.tool_contract import allows_nested_model_calls
 
         capture = func_name != self.__class__.Constants.FUNC_NAME_FOR_STRUCTURE_OUTPUT
         replay_tokens = set_tool_context(
             getattr(self, "_agent_replay_actor_id", getattr(self, "role_name", "unknown")),
             capture=capture,
+            tool_name=func_name,
+            allow_nested_models=allows_nested_model_calls(func_name),
         )
         try:
             result = tool(**args)
@@ -1590,11 +1593,14 @@ class ChatAgent(BaseAgent):
                 func_name, args, {"error": error_msg}, tool_call_id
             )
         from camel.utils.replay_capture import reset_tool_context, set_tool_context
+        from camel.utils.tool_contract import allows_nested_model_calls
 
         capture = func_name != self.__class__.Constants.FUNC_NAME_FOR_STRUCTURE_OUTPUT
         replay_tokens = set_tool_context(
             getattr(self, "_agent_replay_actor_id", getattr(self, "role_name", "unknown")),
             capture=capture,
+            tool_name=func_name,
+            allow_nested_models=allows_nested_model_calls(func_name),
         )
         try:
             result = await tool.async_call(**args)

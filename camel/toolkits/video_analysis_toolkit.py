@@ -177,6 +177,13 @@ class VideoAnalysisToolkit(BaseToolkit):
 
     def _ask_via_gemini(self, video_path: str, question: str) -> str:
         r"""Fallback path: Google Gemini video understanding (paid)."""
+        from camel.utils.replay_capture import record_unreplayable_model_call
+
+        record_unreplayable_model_call(
+            name="video_understanding",
+            provider="google-genai",
+            details={"model": "models/gemini-2.0-flash"},
+        )
         os.environ["GOOGLE_API_KEY"] = os.getenv('GOOGLE_API_KEY')
 
         import pathlib
@@ -207,4 +214,3 @@ class VideoAnalysisToolkit(BaseToolkit):
         """
         return [FunctionTool(self.ask_question_about_video)]
     
-

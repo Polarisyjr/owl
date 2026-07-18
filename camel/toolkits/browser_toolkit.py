@@ -85,8 +85,6 @@ to fast-check whether the current page contains some specific text.
 14. `click_blank_area()`: Click a blank area of the page to unfocus the 
 current element. It is useful when you have clicked an element but it cannot 
 unfocus itself (e.g. Menu bar) to automatically render the updated webpage.
-15. `ask_question_about_video(question: str)`: Ask a question about the 
-current webpage which contains video, e.g. youtube websites.
 """
 
 ASYNC_ACTIONS = [
@@ -116,14 +114,113 @@ ACTION_WITH_FEEDBACK_LIST = [
 
 # Every browser action the agent is allowed to emit (mirrors the numbered list
 # in AVAILABLE_ACTIONS_PROMPT). ASYNC_ACTIONS are awaited; the remaining ones
-# (get_url, ask_question_about_video) run synchronously. Used to reject
+# (get_url) run synchronously. Used to reject
 # hallucinated action names (e.g. `manual_scanning`) with an actionable message
 # instead of letting `self.browser.<name>(...)` raise a bare AttributeError,
 # which the agent can't recover from and just retries in a loop.
 VALID_BROWSER_ACTIONS = set(ASYNC_ACTIONS) | {
     "get_url",
-    "ask_question_about_video",
 }
+
+# This action delegates to VideoAnalysisToolkit and may issue a model request.
+# It remains available to the live Owl browser agent for compatibility, but a
+# recording that exercises it is rejected as a deterministic browser replay.
+MODEL_BACKED_BROWSER_ACTIONS = {"ask_question_about_video"}
+
+
+def normalize_browser_action_code(action_code: str) -> str:
+    r"""Normalize the small action language emitted by the browser agent.
+
+    This preserves the existing tolerance for missing quotes while giving the
+    recorder and replayer one canonical action string.
+    """
+
+    match = re.match(r'(\w+)\((.*)\)', action_code.strip())
+    if not match:
+        return action_code.strip()
+
+    func_name, args_str = match.groups()
+    args = []
+    current_arg = ""
+    in_quotes = False
+    quote_char = None
+    for char in args_str:
+        if char in ['"', "'"]:
+            if not in_quotes:
+                in_quotes = True
+                quote_char = char
+            elif char == quote_char:
+                in_quotes = False
+                quote_char = None
+            current_arg += char
+        elif char == ',' and not in_quotes:
+            args.append(current_arg.strip())
+            current_arg = ""
+        else:
+            current_arg += char
+    if current_arg:
+        args.append(current_arg.strip())
+
+    fixed_args = []
+    for arg in args:
+        if (
+            (arg.startswith('"') and arg.endswith('"'))
+            or (arg.startswith("'") and arg.endswith("'"))
+            or re.match(r'^-?\d+(\.\d+)?$', arg)
+            or re.match(r'^-?\d+\.?\d*[eE][-+]?\d+$', arg)
+            or re.match(r'^0[xX][0-9a-fA-F]+$', arg)
+        ):
+            fixed_args.append(arg)
+        else:
+            fixed_args.append(f"'{arg}'")
+    return f"{func_name}({', '.join(fixed_args)})"
+
+
+async def execute_async_browser_action(
+    browser: Any, action_code: str
+) -> Tuple[bool, str]:
+    r"""Execute one explicit browser action without invoking a model.
+
+    ``browser`` is an ``AsyncBaseBrowser``.  The function is deliberately
+    independent of ``AsyncBrowserToolkit`` so deterministic replay can use the
+    exact same action implementation without constructing planning/web agents.
+    """
+
+    normalized = normalize_browser_action_code(action_code)
+    func_name = extract_function_name(normalized)
+    if func_name not in VALID_BROWSER_ACTIONS:
+        await asyncio.sleep(1)
+        return (
+            False,
+            f"Unknown action `{func_name}`: not a supported browser action. "
+            "Choose exactly one action from the available set: "
+            f"{', '.join(sorted(VALID_BROWSER_ACTIONS))}.",
+        )
+
+    code = f"browser.{normalized}"
+    feedback = any(name in normalized for name in ACTION_WITH_FEEDBACK_LIST)
+    try:
+        result = "Action was successful."
+        if func_name in ASYNC_ACTIONS:
+            coroutine = eval(code)
+            if feedback:
+                result = await coroutine
+            else:
+                await coroutine
+        elif feedback:
+            result = eval(code)
+        else:
+            exec(code)
+        await asyncio.sleep(1)
+        return True, result
+    except Exception as exc:
+        await asyncio.sleep(1)
+        return (
+            False,
+            f"Error while executing the action {normalized}: {exc}. "
+            "If timeout, please recheck whether you have provided the "
+            "correct identifier.",
+        )
 
 
 # Code from magentic-one
@@ -2270,6 +2367,9 @@ class AsyncBrowserToolkit(BaseToolkit):
 
         self.history: list = []
         self.web_agent, self.planning_agent = self._initialize_agent()
+        # The outer browse_url call is orchestration containing model calls.
+        # Replay capture records the model-free primitives instead.
+        self._agent_replay_capture_browser_primitives = True
         
     def _reset(self):
         self.web_agent.reset()
@@ -2417,8 +2517,29 @@ class AsyncBrowserToolkit(BaseToolkit):
         ```
         """
 
-        # get current state
-        som_screenshot, _ = await self.browser.get_som_screenshot(save_image=True)
+        # Capture the model-free browser observation separately from the VLM
+        # request that consumes it.
+        from camel.utils.replay_capture import record_browser_primitive
+
+        observe_started_at_ns = time.time_ns()
+        screenshot_path = None
+        observe_error: str | None = None
+        try:
+            som_screenshot, screenshot_path = await self.browser.get_som_screenshot(
+                save_image=True
+            )
+        except BaseException as exc:
+            observe_error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            record_browser_primitive(
+                name="browser_observe",
+                arguments={"save_image": True},
+                result={"screenshot_path": screenshot_path},
+                error=observe_error,
+                started_at_ns=observe_started_at_ns,
+                ended_at_ns=time.time_ns(),
+            )
         img = _reload_image(som_screenshot)
         message = BaseMessage.make_user_message(
             role_name='user', content=observe_prompt, image_list=[img]
@@ -2463,111 +2584,35 @@ class AsyncBrowserToolkit(BaseToolkit):
             Tuple[bool, str]: A tuple containing a boolean indicating whether
                 the action was successful, and the information to be returned.
         """
+        from camel.utils.replay_capture import record_browser_primitive
 
-        def _check_if_with_feedback(action_code: str) -> bool:
-            r"""Check if the action code needs feedback."""
-
-            for action_with_feedback in ACTION_WITH_FEEDBACK_LIST:
-                if action_with_feedback in action_code:
-                    return True
-
-            return False
-        def _fix_action_code(action_code: str) -> str:
-            r"""Fix potential missing quotes in action code"""
-
-            match = re.match(r'(\w+)\((.*)\)', action_code)
-            if not match:
-                return action_code
-
-            func_name, args_str = match.groups()
-
-            args = []
-            current_arg = ""
-            in_quotes = False
-            quote_char = None
-
-            for char in args_str:
-                if char in ['"', "'"]:
-                    if not in_quotes:
-                        in_quotes = True
-                        quote_char = char
-                        current_arg += char
-                    elif char == quote_char:
-                        in_quotes = False
-                        quote_char = None
-                        current_arg += char
-                    else:
-                        current_arg += char
-                elif char == ',' and not in_quotes:
-                    args.append(current_arg.strip())
-                    current_arg = ""
-                else:
-                    current_arg += char
-
-            if current_arg:
-                args.append(current_arg.strip())
-
-            fixed_args = []
-            for arg in args:
-                if (
-                    (arg.startswith('"') and arg.endswith('"'))
-                    or (arg.startswith("'") and arg.endswith("'"))
-                    or re.match(r'^-?\d+(\.\d+)?$', arg)
-                    or re.match(r'^-?\d+\.?\d*[eE][-+]?\d+$', arg)
-                    or re.match(r'^0[xX][0-9a-fA-F]+$', arg)
-                ):
-                    fixed_args.append(arg)
-
-                else:
-                    fixed_args.append(f"'{arg}'")
-
-            return f"{func_name}({', '.join(fixed_args)})"
-
-        action_code = _fix_action_code(action_code)
-        prefix = "self.browser."
-
+        action_code = normalize_browser_action_code(action_code)
         func_name = extract_function_name(action_code)
-        if func_name not in VALID_BROWSER_ACTIONS:
-            # Reject hallucinated actions (e.g. `manual_scanning`) with a message
-            # the agent can act on, instead of running `self.browser.<name>(...)`
-            # and returning a bare AttributeError it just retries in a loop.
-            await asyncio.sleep(1)
-            return (
-                False,
-                f"Unknown action `{func_name}`: not a supported browser "
-                f"action. Choose exactly one action from the available set: "
-                f"{', '.join(sorted(VALID_BROWSER_ACTIONS))}.",
-            )
-
-        code = f"{prefix}{action_code}"
-        async_flag = func_name in ASYNC_ACTIONS
-        feedback_flag = _check_if_with_feedback(action_code)
-        
+        started_at_ns = time.time_ns()
+        result: Tuple[bool, str] | None = None
+        error: str | None = None
         try:
-            result = "Action was successful."
-            if async_flag:
-                temp_coroutine = eval(code)
-                if feedback_flag:
-                    result = await temp_coroutine
-                else:
-                    await temp_coroutine
-                await asyncio.sleep(1)
-                return True, result
-            else:
-                if feedback_flag:
-                    result = eval(code)
-                else:
-                    exec(code)
-                await asyncio.sleep(1)
-                return True, result
-        
-        except Exception as e:
-            await asyncio.sleep(1)
-            return (
-                False,
-                f"Error while executing the action {action_code}: {e}. "
-                f"If timeout, please recheck whether you have provided the "
-                f"correct identifier.",
+            result = await execute_async_browser_action(
+                self.browser, action_code
+            )
+            return result
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            record_browser_primitive(
+                name="browser_action",
+                arguments={"action_code": action_code},
+                result={
+                    "success": result[0],
+                    "info": result[1],
+                }
+                if result is not None
+                else None,
+                error=error,
+                started_at_ns=started_at_ns,
+                ended_at_ns=time.time_ns(),
+                replayable=func_name not in MODEL_BACKED_BROWSER_ACTIONS,
             )
 
     def _get_final_answer(self, task_prompt: str) -> str:
@@ -2683,7 +2728,27 @@ class AsyncBrowserToolkit(BaseToolkit):
             return True, replanned_schema
         else:
             return False, replanned_schema
-    
+
+    async def _close_browser_primitive(self) -> None:
+        from camel.utils.replay_capture import record_browser_primitive
+
+        started_at_ns = time.time_ns()
+        error: str | None = None
+        try:
+            await self.browser.close()
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            record_browser_primitive(
+                name="browser_close",
+                arguments={},
+                result=None,
+                error=error,
+                started_at_ns=started_at_ns,
+                ended_at_ns=time.time_ns(),
+            )
+
     @dependencies_required("playwright")
     async def browse_url(
         self, task_prompt: str, start_url: str
@@ -2705,13 +2770,32 @@ class AsyncBrowserToolkit(BaseToolkit):
         detailed_plan = self._task_planning(task_prompt, start_url)
         logger.debug(f"Detailed plan: {detailed_plan}")
 
-        await self.browser.async_init()
+        from camel.utils.replay_capture import record_browser_primitive
+
+        open_started_at_ns = time.time_ns()
+        open_error: str | None = None
         try:
+            await self.browser.async_init()
             await self.browser.visit_page(start_url)
         except Exception as e:
-            await self.browser.close()
+            open_error = f"{type(e).__name__}: {e}"
+            await self._close_browser_primitive()
             logger.warning(f"Error visiting the start URL: {start_url}. Exception: {e}")
             return None
+        except BaseException as exc:
+            open_error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            record_browser_primitive(
+                name="browser_open",
+                arguments={"start_url": start_url},
+                result={"current_url": self.browser.get_url()}
+                if open_error is None
+                else None,
+                error=open_error,
+                started_at_ns=open_started_at_ns,
+                ended_at_ns=time.time_ns(),
+            )
 
 
         for i in range(round_limit):
@@ -2769,7 +2853,7 @@ class AsyncBrowserToolkit(BaseToolkit):
         else:
             simulation_result = self._get_final_answer(task_prompt)
 
-        await self.browser.close()
+        await self._close_browser_primitive()
         return simulation_result
     
     def get_tools(self) -> List[FunctionTool]:

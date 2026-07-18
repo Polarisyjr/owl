@@ -1,30 +1,24 @@
-from camel.loaders.chunkr_reader import ChunkrReader
 from camel.toolkits.base import BaseToolkit
 from camel.toolkits.function_tool import FunctionTool
-from camel.toolkits import ImageAnalysisToolkit, AudioAnalysisToolkit, VideoAnalysisToolkit, ExcelToolkit
-from camel.messages import BaseMessage
+from camel.toolkits import AudioAnalysisToolkit, ExcelToolkit, ImageAnalysisToolkit
 from camel.models import ModelFactory, BaseModelBackend
 from camel.types import ModelType, ModelPlatformType
-from camel.models import OpenAIModel, DeepSeekModel
 from camel.agents import ChatAgent
 from docx2markdown._docx_to_markdown import docx_to_markdown
-from chunkr_ai import Chunkr
-import openai
 import requests
 import mimetypes
 import json
 from retry import retry
-from typing import List, Dict, Any, Optional, Tuple, Literal
-from PIL import Image
-from io import BytesIO
+from typing import Any, List, Optional, Tuple
 from loguru import logger
 from bs4 import BeautifulSoup
 import asyncio
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 import os
 import subprocess
+import contextvars
+import hashlib
 import xmltodict
-import asyncio
 import nest_asyncio
 nest_asyncio.apply()
 
@@ -39,9 +33,14 @@ class DocumentProcessingToolkit(BaseToolkit):
         cache_dir: Optional[str] = None,
         image_analysis_model: Optional[BaseModelBackend] = None,
         text_processing_model: Optional[BaseModelBackend] = None,
+        enable_model_features: bool = True,
     ):
-        self.image_tool = ImageAnalysisToolkit(model=image_analysis_model)
-        self.audio_tool = AudioAnalysisToolkit()
+        self.image_tool = (
+            ImageAnalysisToolkit(model=image_analysis_model)
+            if enable_model_features
+            else None
+        )
+        self.audio_tool = AudioAnalysisToolkit() if enable_model_features else None
         self.excel_tool = ExcelToolkit()
         
         self.headers = {
@@ -52,20 +51,118 @@ class DocumentProcessingToolkit(BaseToolkit):
         self.cache_dir = "tmp/"
         if cache_dir:
             self.cache_dir = cache_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
         
-        if self.text_processing_model is None:
+        if enable_model_features and self.text_processing_model is None:
             self.text_processing_model = ModelFactory.create(
                 model_platform=ModelPlatformType.OPENAI,
                 model_type=ModelType.O3_MINI,
                 model_config_dict={"temperature": 0.0}
             )
     
-    # No outer @retry here on purpose. The webpage fetchers and chunkr already
-    # retry internally (tries=3); wrapping this entrypoint in another retry
-    # nests (3×3 = 9 attempts) and could keep a stalling/anti-scrape URL wedged
-    # for minutes. `retry`'s default tries=-1 (infinite) made it even worse.
-    # Let inner failures surface to the agent directly.
-    def extract_document_content(self, document_path: str, query: str = None) -> Tuple[bool, str]:
+    def _resolve_document_parser(self, document_path: str) -> str:
+        """Resolve the parser once so replay receives an explicit choice."""
+
+        parsed = urlparse(document_path)
+        path = parsed.path if parsed.scheme in {"http", "https"} else document_path
+        suffix = os.path.splitext(path)[1].lower()
+        parsers = {
+            ".jpg": "image",
+            ".jpeg": "image",
+            ".png": "image",
+            ".mp3": "audio",
+            ".wav": "audio",
+            ".txt": "text",
+            ".xls": "excel",
+            ".xlsx": "excel",
+            ".csv": "excel",
+            ".zip": "zip",
+            ".json": "json",
+            ".jsonl": "json",
+            ".jsonld": "json",
+            ".py": "python",
+            ".xml": "xml",
+            ".docx": "docx",
+            ".pptx": "pptx",
+            ".pdf": "pdf",
+        }
+        if suffix in parsers:
+            return parsers[suffix]
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return "webpage" if self._is_webpage(document_path) else "generic"
+        return "generic"
+
+    def extract_document_raw(
+        self, document_path: str, parser: str
+    ) -> Tuple[bool, Any]:
+        """Extract content without invoking any language or vision model.
+
+        ``parser`` is explicit rather than inferred inside the replay tool so
+        the recorded invocation fully describes the executed operation.
+        """
+
+        parsed_url = urlparse(document_path)
+        is_url = parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
+
+        if parser in {"image", "audio"}:
+            return False, f"{parser} content requires a model capability"
+        if parser in {"text", "python"}:
+            path = self._download_file(document_path) if is_url else document_path
+            with open(path, "r", encoding="utf-8") as handle:
+                return True, handle.read()
+        if parser == "excel":
+            path = self._download_file(document_path) if is_url else document_path
+            return True, self.excel_tool.extract_excel_content(path)
+        if parser == "zip":
+            path = self._download_file(document_path) if is_url else document_path
+            return True, f"The extracted files are: {self._unzip_file(path)}"
+        if parser == "json":
+            path = self._download_file(document_path) if is_url else document_path
+            with open(path, "r", encoding="utf-8") as handle:
+                if path.endswith(".jsonl"):
+                    return True, handle.read()
+                return True, json.load(handle)
+        if parser == "xml":
+            path = self._download_file(document_path) if is_url else document_path
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            try:
+                return True, xmltodict.parse(content)
+            except Exception:
+                return True, content
+        if parser == "webpage":
+            return True, self._extract_webpage_content(document_path)
+        if parser == "docx":
+            path = self._download_file(document_path) if is_url else document_path
+            output_path = os.path.join(
+                self.cache_dir, f"{os.path.basename(path)}.md"
+            )
+            docx_to_markdown(path, output_path)
+            with open(output_path, "r", encoding="utf-8") as handle:
+                return True, handle.read()
+        if parser == "pptx":
+            from unstructured.partition.auto import partition
+
+            path = self._download_file(document_path) if is_url else document_path
+            return True, [item.text for item in partition(path)]
+        if parser == "pdf":
+            from PyPDF2 import PdfReader
+
+            path = self._download_file(document_path) if is_url else document_path
+            with open(path, "rb") as handle:
+                reader = PdfReader(handle)
+                return True, "".join(page.extract_text() or "" for page in reader.pages)
+        if parser == "generic":
+            from unstructured.partition.auto import partition
+
+            path = self._download_file(document_path) if is_url else document_path
+            return True, [item.text for item in partition(path)]
+        return False, f"Unsupported document parser: {parser}"
+
+    # This remains the Agent-facing orchestration API. Replay capture suppresses
+    # the outer call and records ``document_extract_raw``, model requests, and
+    # ``document_select_chunks`` independently.
+    def extract_document_content(self, document_path: str, query: str = None) -> Tuple[bool, Any]:
         r"""Extract the content of a given document (or url) and return the processed text.
         It may filter out some information, resulting in inaccurate content.
 
@@ -76,145 +173,40 @@ class DocumentProcessingToolkit(BaseToolkit):
         Returns:
             Tuple[bool, str]: A tuple containing a boolean indicating whether the document was processed successfully, and the content of the document (if success).
         """
-        logger.debug(f"Calling extract_document_content function with document_path=`{document_path}`")
+        logger.debug(
+            "Calling extract_document_content function with "
+            f"document_path=`{document_path}`"
+        )
+        parser = self._resolve_document_parser(document_path)
+        if parser == "image":
+            if self.image_tool is None:
+                return False, "Image model capability is disabled"
+            return True, self.image_tool.ask_question_about_image(
+                document_path, "Please make a detailed caption about the image."
+            )
+        if parser == "audio":
+            if self.audio_tool is None:
+                return False, "Audio model capability is disabled"
+            return True, self.audio_tool.ask_question_about_audio(
+                document_path, "Please transcribe the audio content to text."
+            )
+        from camel.utils.replay_capture import run_tool_primitive
 
-        if any(document_path.endswith(ext) for ext in ['.jpg', '.jpeg', '.png']):
-            res = self.image_tool.ask_question_about_image(document_path, "Please make a detailed caption about the image.")
-            return True, res
-        
-        if any(document_path.endswith(ext) for ext in ['.mp3', '.wav']):
-            res = self.audio_tool.ask_question_about_audio(document_path, "Please transcribe the audio content to text.")
-            return True, res
-        
-        if any(document_path.endswith(ext) for ext in ['txt']):
-            with open(document_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            f.close()
-            res = self._post_process_result(content, query)
-            return True, res
-        
-        if any(document_path.endswith(ext) for ext in ['xls', 'xlsx']):
-            res = self.excel_tool.extract_excel_content(document_path)
-            return True, res
-
-        if any(document_path.endswith(ext) for ext in ['zip']): 
-            extracted_files = self._unzip_file(document_path)
-            return True, f"The extracted files are: {extracted_files}"
-
-        if any(document_path.endswith(ext) for ext in ['json', 'jsonl', 'jsonld']):
-            with open(document_path, 'r', encoding='utf-8') as f:
-                content = json.load(f)
-            f.close()
-            return True, content
-        
-        if any(document_path.endswith(ext) for ext in ['py']):
-            with open(document_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            f.close()
-            return True, content
-
-        
-        if any(document_path.endswith(ext) for ext in ['xml']):
-            data = None
-            with open(document_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            f.close()
-
-            try:
-                data = xmltodict.parse(content)
-                logger.debug(f"The extracted xml data is: {data}")
-                return True, data
-            
-            except Exception as e:
-                logger.debug(f"The raw xml data is: {content}")
-                return True, content
-
-
-        if self._is_webpage(document_path):
-            
-            extracted_text = self._extract_webpage_content(document_path)      
-            result_filtered = self._post_process_result(extracted_text, query)
-            return True, result_filtered
-        
-
-        else:
-            # judge if url
-            parsed_url = urlparse(document_path)
-            is_url = all([parsed_url.scheme, parsed_url.netloc])
-            if not is_url:
-                if not os.path.exists(document_path):
-                    return f"Document not found at path: {document_path}."
-
-            # if is docx file, use docx2markdown to convert it
-            if document_path.endswith(".docx"):
-                if is_url:
-                    tmp_path = self._download_file(document_path)
-                else:
-                    tmp_path = document_path
-                
-                file_name = os.path.basename(tmp_path)
-                md_file_path = f"{file_name}.md"
-                docx_to_markdown(tmp_path, md_file_path)
-
-                # load content of md file
-                with open(md_file_path, "r", encoding="utf-8") as f:
-                    extracted_text = f.read()
-                f.close()
-                return True, extracted_text
-            
-            if document_path.endswith(".pptx"):
-                # use unstructured to extract text from pptx
-                try:
-                    from unstructured.partition.auto import partition
-                    extracted_text = partition(document_path)
-                    #return a list of text
-                    extracted_text = [item.text for item in extracted_text]
-                    return True, extracted_text
-                except Exception as e:
-                    logger.error(f"Error occurred while processing pptx: {e}")
-                    return False, f"Error occurred while processing pptx: {e}"
-            
-            try:
-                result = asyncio.run(self._extract_content_with_chunkr(document_path))
-                # raise ValueError("Chunkr is not available.")
-                logger.debug(f"The extracted text from chunkr is: {result}")
-                result_filtered = self._post_process_result(result, query)
-                return True, result_filtered
-
-            except Exception as e:
-                logger.warning(f"Error occurred while using chunkr to process document: {e}")
-                if document_path.endswith(".pdf"):
-                    # try using pypdf to extract text from pdf
-                    try:
-                        from PyPDF2 import PdfReader
-                        if is_url:
-                            tmp_path = self._download_file(document_path)
-                            document_path = tmp_path
-
-                        with open(document_path, 'rb') as f:
-                            reader = PdfReader(f)
-                            extracted_text = ""
-                            for page in reader.pages:
-                                extracted_text += page.extract_text()
-                        
-                        result_filtered = self._post_process_result(extracted_text, query)
-                        return True, result_filtered
-
-                    except Exception as e:
-                        logger.error(f"Error occurred while processing pdf: {e}")
-                        return False, f"Error occurred while processing pdf: {e}"
-                
-                # use unstructured to extract text from file
-                try:
-                    from unstructured.partition.auto import partition
-                    extracted_text = partition(document_path)
-                    #return a list of text
-                    extracted_text = [item.text for item in extracted_text]
-                    return True, extracted_text
-                
-                except Exception as e:
-                    logger.error(f"Error occurred while processing document: {e}")
-                    return False, f"Error occurred while processing document: {e}"
+        try:
+            success, content = run_tool_primitive(
+                name="document_extract_raw",
+                arguments={"document_path": document_path, "parser": parser},
+                function=lambda: self.extract_document_raw(document_path, parser),
+                toolkit="DocumentExtractionPrimitive",
+            )
+        except Exception as exc:
+            logger.error(f"Error occurred while processing document: {exc}")
+            return False, f"Error occurred while processing document: {exc}"
+        if not success:
+            return success, content
+        if parser in {"text", "webpage", "pdf"} and isinstance(content, str):
+            content = self._post_process_result(content, query)
+        return True, content
     
     
     def _post_process_result(self, result: str, query: str) -> str:
@@ -261,25 +253,68 @@ Query:
             result_cache = {}
             # use concurrent.futures to process the parts
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-                futures = [executor.submit(_identify_relevant_part, part_idx, part, query, self.text_processing_model) for part_idx, part in enumerate(parts)]
+                futures = [
+                    executor.submit(
+                        contextvars.copy_context().run,
+                        _identify_relevant_part,
+                        part_idx,
+                        part,
+                        query,
+                        self.text_processing_model,
+                    )
+                    for part_idx, part in enumerate(parts)
+                ]
                 for future in concurrent.futures.as_completed(futures):
                     is_relevant, part_idx, part = future.result()
                     if is_relevant:
                         result_cache[part_idx] = part
-            # re-assemble the parts according to the part_idx
-            result_filtered = ""
-            for part_idx in sorted(result_cache.keys()):
-                result_filtered += result_cache[part_idx]
-                result_filtered += "..."
-            
-            result_filtered += "(The above is the re-assembled result of the document, because the original document is too long. If empty, it means no relevant information found.)"
-            if len(result_filtered) > max_length:
-                result_filtered = result_filtered[:max_length]          # TODO: Refine it to be more accurate
-            logger.debug(f"split context length: {len(result_filtered)}")
-            return result_filtered
+            selected_indices = sorted(result_cache)
+            from camel.utils.replay_capture import run_tool_primitive
+
+            return run_tool_primitive(
+                name="document_select_chunks",
+                arguments={
+                    "selected_indices": selected_indices,
+                    "split_length": split_length,
+                    "max_length": max_length,
+                    "source_sha256": hashlib.sha256(result.encode()).hexdigest(),
+                },
+                function=lambda: self.select_document_chunks(
+                    result,
+                    selected_indices,
+                    split_length=split_length,
+                    max_length=max_length,
+                ),
+                toolkit="DocumentExtractionPrimitive",
+            )
         
         else:
             return result
+
+    def select_document_chunks(
+        self,
+        result: str,
+        selected_indices: List[int],
+        *,
+        split_length: int = 40000,
+        max_length: int = 200000,
+    ) -> str:
+        """Deterministically assemble chunk indexes selected by an LM event."""
+
+        parts = [result[i : i + split_length] for i in range(0, len(result), split_length)]
+        invalid = [index for index in selected_indices if index < 0 or index >= len(parts)]
+        if invalid:
+            raise ValueError(f"Invalid document chunk indexes: {invalid}")
+        filtered = "".join(f"{parts[index]}..." for index in selected_indices)
+        filtered += (
+            "(The above is the re-assembled result of the document, because "
+            "the original document is too long. If empty, it means no relevant "
+            "information found.)"
+        )
+        if len(filtered) > max_length:
+            filtered = filtered[:max_length]
+        logger.debug(f"split context length: {len(filtered)}")
+        return filtered
 
 
     def _is_webpage(self, url: str) -> bool:
@@ -312,40 +347,6 @@ Query:
             return True
     
 
-    @retry(requests.RequestException, tries=3, delay=2, backoff=2, max_delay=30)
-    async def _extract_content_with_chunkr(self, document_path: str, output_format: Literal['json', 'markdown'] = 'markdown') -> str:
-        
-        chunkr = Chunkr(api_key=os.getenv("CHUNKR_API_KEY"))
-        
-        result = await chunkr.upload(document_path)
-        
-        # result = chunkr.upload(document_path)
-
-        if result.status == "Failed":
-            logger.error(f"Error while processing document {document_path}: {result.message}")
-            return f"Error while processing document: {result.message}"
-        
-        # extract document name
-        document_name = os.path.basename(document_path)
-        output_file_path: str
-
-        if output_format == 'json':
-            output_file_path = f"{document_name}.json"
-            result.json(output_file_path)
-
-        elif output_format == 'markdown':
-            output_file_path = f"{document_name}.md"
-            result.markdown(output_file_path)
-
-        else:
-            return "Invalid output format."
-        
-        with open(output_file_path, "r", encoding="utf-8") as f:
-            extracted_text = f.read()
-        f.close()
-        return extracted_text
-    
-    
     # Bounded retry + explicit (connect, read) timeout. Without a timeout a
     # webpage GET can hang forever (server accepts the connection then never
     # responds), and the default `retry` tries=-1 made that an *infinite* retry
@@ -464,8 +465,8 @@ Query:
 
         logger.debug(f"Extracted data from {url} using firecrawl: {data}")
         if len(data['data']) == 0:
-            if data['success'] == True:
-                logger.debug(f"Trying to use html2text to get the text.")
+            if data['success']:
+                logger.debug("Trying to use html2text to get the text.")
                 # try using html2text to get the text
                 extracted_text = self._extract_webpage_content_with_html2text(url)
                 logger.debug(f"The extracted text from html2text is: {extracted_text}")
