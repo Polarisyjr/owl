@@ -19,7 +19,6 @@ openpyxl>=3.1.5
 tabulate>=0.9.0
 xls2xlsx>=0.2.0
 docx2markdown>=0.1.1
-chunkr_ai>=0.0.41
 playwright>=1.50.0
 html2text>=2024.2.26
 
@@ -66,7 +65,8 @@ pandasai>=2.3.0
 # Optional dependencies - Media processing tools
 imageio[pyav]>=2.34.2
 pydub>=0.25.1
-yt-dlp>=2024.11.4
+yt-dlp>=2026.6.9
+bgutil-ytdlp-pot-provider>=1.3.1
 ffmpeg-python>=0.2.0
 
 # Optional dependencies - Web and API tools

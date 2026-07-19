@@ -6,9 +6,9 @@ All 12 model call-sites in the GAIA workforce are routed through `make_model(rol
   Workforce orchestrators (3): coordinator, task, answerer
   Worker agents (3):           web, document, reasoning
   Toolkit-internal models (6): image, audio, browser_web, browser_planning,
-                               video (CAMEL extracts frames client-side via
-                                      BaseMessage.video_bytes, so any image-
-                                      capable VL model works),
+                               video (the toolkit extracts replayable frames
+                                      client-side, so any image-capable VL
+                                      model works),
                                and document (reused for DocumentProcessingToolkit's
                                              long-doc re-ranking inside
                                              _post_process_result)
@@ -248,6 +248,7 @@ def construct_agent_list(worker_id: int = 0) -> List[Dict[str, Any]]:
     reasoning_model          = make_model("reasoning")
     image_analysis_model     = make_model("image")
     audio_reasoning_model    = make_model("audio")
+    video_analysis_model     = make_model("video")
     browser_web_model        = make_model("browser_web")
     browser_planning_model   = make_model("browser_planning")
 
@@ -264,7 +265,7 @@ def construct_agent_list(worker_id: int = 0) -> List[Dict[str, Any]]:
     image_analysis_toolkit = ImageAnalysisToolkit(model=image_analysis_model)
     video_analysis_toolkit = VideoAnalysisToolkit(
         download_directory=f"{tmp_root}/video",
-        model=make_model("video"),
+        model=video_analysis_model,
     )
     audio_analysis_toolkit = AudioAnalysisToolkit(
         cache_dir=f"{tmp_root}/audio",
@@ -278,6 +279,7 @@ def construct_agent_list(worker_id: int = 0) -> List[Dict[str, Any]]:
         cache_dir=f"{tmp_root}/browser",
         planning_agent_model=browser_planning_model,
         web_agent_model=browser_web_model,
+        video_analysis_model=video_analysis_model,
     )
     excel_toolkit = ExcelToolkit()
 
@@ -292,6 +294,7 @@ Keep in mind that:
 - When solving tasks that require web searches, check Wikipedia first before exploring other websites.
 - You can also simulate browser actions to get more information or verify the information you have found.
 - Browser simulation is also helpful for finding target URLs. Browser simulation operations do not necessarily need to find specific answers, but can also help find web page URLs that contain answers (usually difficult to find through simple web searches). You can find the answer to the question by performing subsequent operations on the URL, such as extracting the content of the webpage.
+- When a task requires inspecting the actual visual content of a video, prefer `ask_question_about_video` with the video URL and a precise question. Page text, search, or code can then provide supplementary verification or follow-up analysis.
 - Do not solely rely on document tools or browser simulation to find the answer, you should combine document tools and browser simulation to comprehensively process web page information. Some content may need to do browser simulation to get, or some content is rendered by javascript.
 - In your response, you should mention the urls you have visited and processed.
 
@@ -316,7 +319,12 @@ Here are some tips that help you perform web search:
     web_agent._agent_replay_actor_id = "web"
 
     document_processing_agent = OwlWorkforceChatAgent(
-        "You are a helpful assistant that can process documents and multimodal data, such as images, audio, and video.",
+        """You are a helpful assistant that can process documents and
+multimodal data, such as images, audio, and video. When the task requires
+inspecting the actual visual content of a video, prefer
+`ask_question_about_video` with the video URL/path and a precise question.
+Page metadata and web search can supplement the visual analysis, while
+`execute_code` is useful for follow-up computation or transformations.""",
         document_processing_model,
         token_limit=_resolve_token_limit("document"),
         tools=[

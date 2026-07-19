@@ -121,6 +121,7 @@ def run_tool_primitive(
     arguments: dict[str, Any],
     function: Callable[[], T],
     toolkit: str,
+    record_result: Callable[[T], Any] | None = None,
 ) -> T:
     """Execute and capture one synchronous model-free replay primitive."""
 
@@ -130,9 +131,11 @@ def run_tool_primitive(
     tool_token = _tool_name.set(name)
     allow_token = _allow_nested_models.set(False)
     result: Any = None
+    captured_result: Any = None
     error: str | None = None
     try:
         result = function()
+        captured_result = record_result(result) if record_result else result
         return result
     except BaseException as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -148,7 +151,7 @@ def run_tool_primitive(
                 "toolkit": toolkit,
                 "invocation": {"name": name, "arguments": arguments},
                 "status": "error" if error else "success",
-                "output": result,
+                "output": captured_result,
                 "error": error,
                 "started_at_ns": started_at_ns,
                 "ended_at_ns": time.time_ns(),

@@ -85,6 +85,8 @@ to fast-check whether the current page contains some specific text.
 14. `click_blank_area()`: Click a blank area of the page to unfocus the 
 current element. It is useful when you have clicked an element but it cannot 
 unfocus itself (e.g. Menu bar) to automatically render the updated webpage.
+15. `ask_question_about_video(question: str)`: Ask a question about the
+current webpage which contains video, e.g. youtube websites.
 """
 
 ASYNC_ACTIONS = [
@@ -114,17 +116,18 @@ ACTION_WITH_FEEDBACK_LIST = [
 
 # Every browser action the agent is allowed to emit (mirrors the numbered list
 # in AVAILABLE_ACTIONS_PROMPT). ASYNC_ACTIONS are awaited; the remaining ones
-# (get_url) run synchronously. Used to reject
+# (get_url, ask_question_about_video) run synchronously. Used to reject
 # hallucinated action names (e.g. `manual_scanning`) with an actionable message
 # instead of letting `self.browser.<name>(...)` raise a bare AttributeError,
 # which the agent can't recover from and just retries in a loop.
 VALID_BROWSER_ACTIONS = set(ASYNC_ACTIONS) | {
     "get_url",
+    "ask_question_about_video",
 }
 
-# This action delegates to VideoAnalysisToolkit and may issue a model request.
-# It remains available to the live Owl browser agent for compatibility, but a
-# recording that exercises it is rejected as a deterministic browser replay.
+# This action delegates to VideoAnalysisToolkit and issues a model request.
+# Live Owl may execute it, while capture records its video primitives and VLM
+# request instead of admitting the outer action as a browser replay tool.
 MODEL_BACKED_BROWSER_ACTIONS = {"ask_question_about_video"}
 
 
@@ -179,11 +182,12 @@ def normalize_browser_action_code(action_code: str) -> str:
 async def execute_async_browser_action(
     browser: Any, action_code: str
 ) -> Tuple[bool, str]:
-    r"""Execute one explicit browser action without invoking a model.
+    r"""Execute one explicit browser action.
 
     ``browser`` is an ``AsyncBaseBrowser``.  The function is deliberately
-    independent of ``AsyncBrowserToolkit`` so deterministic replay can use the
-    exact same action implementation without constructing planning/web agents.
+    independent of ``AsyncBrowserToolkit`` so replay can reuse the model-free
+    actions without constructing planning/web agents. Model-backed actions are
+    filtered by the replay worker before it calls this helper.
     """
 
     normalized = normalize_browser_action_code(action_code)
@@ -585,12 +589,19 @@ def _get_random_color(identifier: int) -> Tuple[int, int, int, int]:
 
 
 class BaseBrowser:
-    def __init__(self, headless=True, cache_dir: Optional[str] = None):
+    def __init__(
+        self,
+        headless: bool = True,
+        cache_dir: Optional[str] = None,
+        video_analysis_model: Optional[BaseModelBackend] = None,
+    ):
         r"""Initialize the WebBrowserToolkit instance.
 
         Args:
             headless (bool): Whether to run the browser in headless mode.
             cache_dir (Union[str, None]): The directory to store cache files.
+            video_analysis_model (Optional[BaseModelBackend]): Local model
+                backend used by the browser video-question action.
 
         Returns:
             None
@@ -607,6 +618,7 @@ class BaseBrowser:
         # Set the cache directory
         self.cache_dir = "tmp/" if cache_dir is None else cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
+        self.video_analysis_model = video_analysis_model
 
         # Load the page script
         abs_dir_path = os.path.dirname(os.path.abspath(__file__))
@@ -666,7 +678,10 @@ class BaseBrowser:
         Returns:
             str: The answer to the question.
         """
-        video_analyzer = VideoAnalysisToolkit()
+        video_analyzer = VideoAnalysisToolkit(
+            download_directory=os.path.join(self.cache_dir, "video"),
+            model=self.video_analysis_model,
+        )
         result = video_analyzer.ask_question_about_video(
             self.page_url, question
         )
@@ -1111,13 +1126,20 @@ class BaseBrowser:
         return markdown_content
 
 class AsyncBaseBrowser:
-    def __init__(self, headless: bool = True, cache_dir: Optional[str] = None):
+    def __init__(
+        self,
+        headless: bool = True,
+        cache_dir: Optional[str] = None,
+        video_analysis_model: Optional[BaseModelBackend] = None,
+    ):
         r"""
         Initialize the asynchronous browser core.
 
         Args:
             headless (bool): Whether to run the browser in headless mode.
             cache_dir (Optional[str]): The directory to store cache files.
+            video_analysis_model (Optional[BaseModelBackend]): Local model
+                backend used by the browser video-question action.
         
         Returns:
             None
@@ -1137,6 +1159,7 @@ class AsyncBaseBrowser:
         # Set the cache directory
         self.cache_dir = "tmp/" if cache_dir is None else cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
+        self.video_analysis_model = video_analysis_model
 
         # Load the page script
         abs_dir_path = os.path.dirname(os.path.abspath(__file__))
@@ -1240,7 +1263,10 @@ class AsyncBaseBrowser:
         Returns:
             str: The answer to the question.
         """
-        video_analyzer = VideoAnalysisToolkit()
+        video_analyzer = VideoAnalysisToolkit(
+            download_directory=os.path.join(self.cache_dir, "video"),
+            model=self.video_analysis_model,
+        )
         result = video_analyzer.ask_question_about_video(
             self.page_url, question
         )
@@ -1819,6 +1845,7 @@ class BrowserToolkit(BaseToolkit):
         history_window: int = 5,
         web_agent_model: Optional[BaseModelBackend] = None,
         planning_agent_model: Optional[BaseModelBackend] = None,
+        video_analysis_model: Optional[BaseModelBackend] = None,
         output_language: str = "en",
     ):
         r"""Initialize the BrowserToolkit instance.
@@ -1832,9 +1859,15 @@ class BrowserToolkit(BaseToolkit):
                 for the web agent.
             planning_agent_model (Optional[BaseModelBackend]): The model
                 backend for the planning agent.
+            video_analysis_model (Optional[BaseModelBackend]): Local model
+                backend used by the browser video-question action.
         """
 
-        self.browser = BaseBrowser(headless=headless, cache_dir=cache_dir)
+        self.browser = BaseBrowser(
+            headless=headless,
+            cache_dir=cache_dir,
+            video_analysis_model=video_analysis_model,
+        )
 
         self.history_window = history_window
         self.web_agent_model = web_agent_model
@@ -2343,6 +2376,7 @@ class AsyncBrowserToolkit(BaseToolkit):
         history_window: int = 5,
         web_agent_model: Optional[BaseModelBackend] = None,
         planning_agent_model: Optional[BaseModelBackend] = None,
+        video_analysis_model: Optional[BaseModelBackend] = None,
         output_language: str = "en",
     ):
         
@@ -2357,8 +2391,14 @@ class AsyncBrowserToolkit(BaseToolkit):
                 for the web agent.
             planning_agent_model (Optional[BaseModelBackend]): The model
                 backend for the planning agent.
+            video_analysis_model (Optional[BaseModelBackend]): Local model
+                backend used by the browser video-question action.
         """
-        self.browser = AsyncBaseBrowser(headless=headless, cache_dir=cache_dir)
+        self.browser = AsyncBaseBrowser(
+            headless=headless,
+            cache_dir=cache_dir,
+            video_analysis_model=video_analysis_model,
+        )
         
         self.history_window = history_window
         self.web_agent_model = web_agent_model
@@ -2600,20 +2640,24 @@ class AsyncBrowserToolkit(BaseToolkit):
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            record_browser_primitive(
-                name="browser_action",
-                arguments={"action_code": action_code},
-                result={
-                    "success": result[0],
-                    "info": result[1],
-                }
-                if result is not None
-                else None,
-                error=error,
-                started_at_ns=started_at_ns,
-                ended_at_ns=time.time_ns(),
-                replayable=func_name not in MODEL_BACKED_BROWSER_ACTIONS,
-            )
+            # Model-backed actions are orchestration boundaries. Their
+            # download/frame primitives and VLM request are captured inside
+            # VideoAnalysisToolkit, so the outer action must not masquerade as
+            # a replayable browser tool or make the recording fail closed.
+            if func_name not in MODEL_BACKED_BROWSER_ACTIONS:
+                record_browser_primitive(
+                    name="browser_action",
+                    arguments={"action_code": action_code},
+                    result={
+                        "success": result[0],
+                        "info": result[1],
+                    }
+                    if result is not None
+                    else None,
+                    error=error,
+                    started_at_ns=started_at_ns,
+                    ended_at_ns=time.time_ns(),
+                )
 
     def _get_final_answer(self, task_prompt: str) -> str:
         r"""Get the final answer based on the task prompt and current browser state.

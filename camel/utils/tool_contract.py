@@ -2,8 +2,8 @@
 
 The public Agent API may expose orchestration helpers and model-backed
 capabilities as ``FunctionTool`` objects.  That does not make them replay
-tools: only ``deterministic_tool`` entries are eligible for direct execution
-by the replay worker.
+tools: only explicit ``deterministic_tool`` and ``external_tool`` primitives
+are eligible for direct execution by the replay worker.
 """
 
 from __future__ import annotations
@@ -37,6 +37,8 @@ TOOL_EXECUTION_CONTRACTS: dict[str, ToolExecutionKind] = {
     "browser_close": "deterministic_tool",
     "document_extract_raw": "external_tool",
     "document_select_chunks": "deterministic_tool",
+    "video_download": "external_tool",
+    "video_extract_frames": "deterministic_tool",
     "execute_code": "deterministic_tool",
     "extract_excel_content": "deterministic_tool",
     # These contain no model, but their remote observations can change.

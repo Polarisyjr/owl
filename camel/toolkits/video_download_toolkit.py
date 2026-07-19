@@ -13,6 +13,9 @@
 # ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
 
 import io
+import os
+import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import List, Optional
@@ -26,6 +29,34 @@ from camel.toolkits.function_tool import FunctionTool
 from camel.utils import dependencies_required
 
 logger = get_logger(__name__)
+
+
+def _parse_cookies_from_browser(
+    specification: str,
+) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+    r"""Parse yt-dlp's BROWSER[+KEYRING][:PROFILE][::CONTAINER] syntax."""
+    match = re.fullmatch(
+        r"(?P<name>[^+:]+)"
+        r"(?:\s*\+\s*(?P<keyring>[^:]+))?"
+        r"(?:\s*:\s*(?!:)(?P<profile>.+?))?"
+        r"(?:\s*::\s*(?P<container>.+))?",
+        specification.strip(),
+    )
+    if match is None:
+        raise ValueError(
+            "Invalid browser cookie specification. Expected "
+            "BROWSER[+KEYRING][:PROFILE][::CONTAINER]."
+        )
+
+    browser, keyring, profile, container = match.group(
+        "name", "keyring", "profile", "container"
+    )
+    return (
+        browser.lower(),
+        os.path.expanduser(profile) if profile else None,
+        keyring.upper() if keyring else None,
+        container,
+    )
 
 
 def _capture_screenshot(video_file: str, timestamp: float) -> Image.Image:
@@ -65,6 +96,10 @@ class VideoDownloaderToolkit(BaseToolkit):
             (default: :obj:`None`)
         cookies_path (Optional[str], optional): The path to the cookies file
             for the video service in Netscape format. (default: :obj:`None`)
+        cookies_from_browser (Optional[str], optional): A live browser profile
+            in yt-dlp's BROWSER[+KEYRING][:PROFILE][::CONTAINER] format. When
+            set, it takes precedence over ``cookies_path``. (default:
+            :obj:`None`)
     """
 
     @dependencies_required("yt_dlp", "ffmpeg")
@@ -72,11 +107,22 @@ class VideoDownloaderToolkit(BaseToolkit):
         self,
         download_directory: Optional[str] = None,
         cookies_path: Optional[str] = None,
+        cookies_from_browser: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> None:
         super().__init__(timeout=timeout)
         self._cleanup = download_directory is None
-        self._cookies_path = cookies_path
+        self._cookies_path = cookies_path or os.environ.get(
+            "OWL_VIDEO_COOKIES_PATH"
+        )
+        browser_cookie_spec = cookies_from_browser or os.environ.get(
+            "OWL_VIDEO_COOKIES_FROM_BROWSER"
+        )
+        self._cookies_from_browser = (
+            _parse_cookies_from_browser(browser_cookie_spec)
+            if browser_cookie_spec
+            else None
+        )
 
         self._download_directory = Path(
             download_directory or tempfile.mkdtemp()
@@ -101,9 +147,13 @@ class VideoDownloaderToolkit(BaseToolkit):
         Cleans up the downloaded video if they are stored in a temporary
         directory.
         """
-        import shutil
+        try:
+            import shutil
+        except ImportError:
+            # Interpreter shutdown may have already torn down import state.
+            return
 
-        if self._cleanup:
+        if getattr(self, "_cleanup", False):
             shutil.rmtree(self._download_directory, ignore_errors=True)
 
     def download_video(self, url: str) -> str:
@@ -118,12 +168,77 @@ class VideoDownloaderToolkit(BaseToolkit):
         import yt_dlp
 
         video_template = self._download_directory / "%(title)s.%(ext)s"
+        cookie_copy: Optional[Path] = None
+        if self._cookies_path and self._cookies_from_browser is None:
+            source_cookies = Path(self._cookies_path).resolve()
+            if not source_cookies.is_file():
+                raise ValueError(
+                    f"Video cookie file does not exist: {source_cookies}"
+                )
+            fd, cookie_copy_name = tempfile.mkstemp(
+                prefix=".yt-dlp-cookies-",
+                suffix=".txt",
+                dir=self._download_directory,
+            )
+            os.close(fd)
+            cookie_copy = Path(cookie_copy_name)
+            shutil.copyfile(source_cookies, cookie_copy)
+            cookie_copy.chmod(0o600)
+        hostname = (urlparse(url).hostname or "").lower()
+        is_youtube = hostname == "youtu.be" or hostname.endswith(
+            ".youtube.com"
+        )
         ydl_opts = {
-            'format': 'bestvideo+bestaudio/best',
+            # Some YouTube clients expose DASH URLs that pass extraction but
+            # return 403 when fetched. Prefer the combined HLS rendition there;
+            # retain yt-dlp's normal best-video/audio fallback everywhere.
+            'format': (
+                'best[protocol^=m3u8][language^=en]/'
+                'best[protocol^=m3u8]/bestvideo+bestaudio/best'
+                if is_youtube
+                else 'bestvideo+bestaudio/best'
+            ),
             'outtmpl': str(video_template),
             'force_generic_extractor': True,
-            'cookiefile': self._cookies_path,
+            # yt-dlp updates its cookie jar in place. Always give it a private
+            # per-call copy so authenticated source cookies stay immutable and
+            # concurrent workers cannot corrupt each other's sessions.
+            'cookiefile': str(cookie_copy) if cookie_copy else None,
         }
+        if self._cookies_from_browser is not None:
+            # yt-dlp copies the browser database before reading it, so the
+            # persistent browser may remain open while downloads use the most
+            # recent cookies committed to its profile.
+            ydl_opts['cookiesfrombrowser'] = self._cookies_from_browser
+        if youtube_clients := os.environ.get(
+            "OWL_VIDEO_YOUTUBE_PLAYER_CLIENT"
+        ):
+            ydl_opts['extractor_args'] = {
+                'youtube': {
+                    'player_client': [
+                        client.strip()
+                        for client in youtube_clients.split(',')
+                        if client.strip()
+                    ]
+                }
+            }
+        if ffmpeg_location := os.environ.get("OWL_VIDEO_FFMPEG_LOCATION"):
+            ydl_opts['ffmpeg_location'] = ffmpeg_location
+        if js_runtime := os.environ.get("OWL_VIDEO_JS_RUNTIME"):
+            runtime_name, separator, runtime_path = js_runtime.partition(":")
+            ydl_opts["js_runtimes"] = {
+                runtime_name.lower(): {
+                    "path": runtime_path if separator else None,
+                }
+            }
+        if remote_components := os.environ.get(
+            "OWL_VIDEO_REMOTE_COMPONENTS"
+        ):
+            ydl_opts["remote_components"] = {
+                component.strip()
+                for component in remote_components.split(",")
+                if component.strip()
+            }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -133,6 +248,9 @@ class VideoDownloaderToolkit(BaseToolkit):
                 return ydl.prepare_filename(info)
         except yt_dlp.utils.DownloadError as e:
             raise RuntimeError(f"Failed to download video from {url}: {e}")
+        finally:
+            if cookie_copy is not None:
+                cookie_copy.unlink(missing_ok=True)
 
     def get_video_bytes(
         self,

@@ -65,3 +65,8 @@ results/*
 
 # GAIA per-task document-conversion artifacts (e.g. <uuid>.docx.md)
 *.docx.md
+tmp*/
+
+# Local authenticated media session; never commit browser cookies.
+/cookies.txt
+data-gym-cache/

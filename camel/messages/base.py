@@ -59,6 +59,9 @@ class BaseMessage:
             images associated with the message. (default: :obj:`auto`)
         video_detail (Literal["auto", "low", "high"]): Detail level of the
             videos associated with the message. (default: :obj:`low`)
+        media_before_text (bool): Whether image/video parts should precede the
+            text part in an OpenAI multimodal user message. (default:
+            :obj:`False`)
         parsed: Optional[Union[Type[BaseModel], dict]]: Optional object which
             is parsed from the content. (default: :obj:`None`)
     """
@@ -73,6 +76,7 @@ class BaseMessage:
     image_detail: Literal["auto", "low", "high"] = "auto"
     video_detail: Literal["auto", "low", "high"] = "low"
     parsed: Optional[Union[BaseModel, dict]] = None
+    media_before_text: bool = False
 
     @classmethod
     def make_user_message(
@@ -417,30 +421,26 @@ class BaseMessage:
             OpenAIUserMessage: The converted :obj:`OpenAIUserMessage` object.
         """
         hybrid_content: List[Any] = []
-        hybrid_content.append(
-            {
-                "type": "text",
-                "text": self.content,
-            }
-        )
+        text_content = {"type": "text", "text": self.content}
+        if not self.media_before_text:
+            hybrid_content.append(text_content)
         if self.image_list and len(self.image_list) > 0:
             for image in self.image_list:
-                if image.format is None:
-                    raise ValueError(
-                        f"Image's `format` is `None`, please "
-                        f"transform the `PIL.Image.Image` to  one of "
-                        f"following supported formats, such as "
-                        f"{list(OpenAIImageType)}"
-                    )
-
-                image_type: str = image.format.lower()
+                # Pillow drops ``format`` when an image is resized or copied;
+                # CAMEL's in-memory storage deep-copies messages before this
+                # encoder runs. Choose an explicit lossless format for images
+                # with transparency and JPEG for ordinary RGB/L frames.
+                image_format = image.format or (
+                    "PNG" if image.mode in {"RGBA", "LA", "P"} else "JPEG"
+                )
+                image_type: str = image_format.lower()
                 if image_type not in OpenAIImageType:
                     raise ValueError(
-                        f"Image type {image.format} "
+                        f"Image type {image_format} "
                         f"is not supported by OpenAI vision model"
                     )
                 with io.BytesIO() as buffer:
-                    image.save(fp=buffer, format=image.format)
+                    image.save(fp=buffer, format=image_format)
                     encoded_image = base64.b64encode(buffer.getvalue()).decode(
                         "utf-8"
                     )
@@ -505,6 +505,9 @@ class BaseMessage:
                 }
 
                 hybrid_content.append(item)
+
+        if self.media_before_text:
+            hybrid_content.append(text_content)
 
         if len(hybrid_content) > 1:
             return {

@@ -36,6 +36,7 @@ from camel.toolkits.base import BaseToolkit
 from camel.toolkits.function_tool import FunctionTool
 from camel.types import ModelPlatformType, ModelType
 from camel.utils import dependencies_required
+from camel.utils.constants import Constants
 from loguru import logger
 
 from .video_download_toolkit import (
@@ -96,41 +97,62 @@ class VideoAnalysisToolkit(BaseToolkit):
             system_message=system_msg,
         )
 
-    def _load_video_bytes(self, video_path: str) -> bytes:
-        r"""Loads a video from either local path or URL.
+    def resolve_video_path(self, video_path: str) -> str:
+        r"""Resolve a local video path, downloading remote pages with yt-dlp.
 
         Args:
             video_path (str): Local path or URL to video.
 
         Returns:
-            bytes: Raw video file contents.
+            str: A local path containing the video payload.
 
         Raises:
-            ValueError: For invalid paths or unreadable files.
-            requests.exceptions.RequestException: For URL fetch failures.
+            ValueError: If a local path does not exist.
         """
         parsed = urlparse(video_path)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        }
-
         if parsed.scheme in ("http", "https"):
-            logger.debug(f"Fetching video from URL: {video_path}")
-            try:
-                response = requests.get(video_path, timeout=30, headers=headers)
-                response.raise_for_status()
-                return response.content
-            except requests.exceptions.RequestException as e:
-                logger.error(f"URL fetch failed: {e}")
-                raise
-        else:
-            logger.debug(f"Loading local video: {video_path}")
-            try:
-                with open(video_path, "rb") as f:
-                    return f.read()
-            except Exception as e:
-                logger.error(f"Video loading failed: {e}")
-                raise ValueError(f"Invalid video file: {e}")
+            return self.video_downloader_toolkit.download_video(video_path)
+        path = Path(video_path).resolve()
+        if not path.is_file():
+            raise ValueError(f"Invalid video file: {video_path}")
+        return str(path)
+
+    def extract_video_frames(
+        self,
+        video_path: str,
+        *,
+        frame_interval: int = Constants.VIDEO_IMAGE_EXTRACTION_INTERVAL,
+        image_size: int = Constants.VIDEO_DEFAULT_IMAGE_SIZE,
+    ) -> List[Image.Image]:
+        r"""Extract the same sampled, resized frames used by BaseMessage."""
+
+        import imageio.v3 as iio
+
+        if frame_interval <= 0:
+            raise ValueError("frame_interval must be positive")
+        if image_size <= 0:
+            raise ValueError("image_size must be positive")
+
+        frames: List[Image.Image] = []
+        for frame_count, frame in enumerate(
+            iio.imiter(video_path, plugin=Constants.VIDEO_DEFAULT_PLUG_PYAV),
+            start=1,
+        ):
+            if frame_count % frame_interval != 0:
+                continue
+            frame_image = Image.fromarray(frame)
+            width, height = frame_image.size
+            if height <= 0:
+                raise ValueError("video frame has invalid height")
+            new_height = int(image_size / (width / height))
+            resized_frame = frame_image.resize((image_size, new_height))
+            # BaseMessage's image-list encoder needs an explicit format in
+            # order to serialize PIL images into OpenAI image_url parts.
+            resized_frame.format = "JPEG"
+            frames.append(resized_frame)
+        if not frames:
+            raise ValueError("No frames were extracted from the video")
+        return frames
 
     def _analyze_video(
         self,
@@ -150,7 +172,34 @@ class VideoAnalysisToolkit(BaseToolkit):
             str: Analysis result or error message.
         """
         try:
-            video_bytes = self._load_video_bytes(video_path)
+            from camel.utils.replay_capture import run_tool_primitive
+
+            local_video_path = run_tool_primitive(
+                name="video_download",
+                arguments={"video_path": video_path},
+                function=lambda: self.resolve_video_path(video_path),
+                toolkit="VideoAnalysisPrimitive",
+            )
+            frames = run_tool_primitive(
+                name="video_extract_frames",
+                arguments={
+                    "frame_interval": Constants.VIDEO_IMAGE_EXTRACTION_INTERVAL,
+                    "image_size": Constants.VIDEO_DEFAULT_IMAGE_SIZE,
+                },
+                function=lambda: self.extract_video_frames(local_video_path),
+                toolkit="VideoAnalysisPrimitive",
+                record_result=lambda sampled_frames: {
+                    "frame_count": len(sampled_frames),
+                    "frames": [
+                        {
+                            "width": frame.width,
+                            "height": frame.height,
+                            "mode": frame.mode,
+                        }
+                        for frame in sampled_frames
+                    ],
+                },
+            )
             logger.info(f"Analyzing video: {video_path}")
 
             agent = ChatAgent(
@@ -161,8 +210,13 @@ class VideoAnalysisToolkit(BaseToolkit):
             user_msg = BaseMessage.make_user_message(
                 role_name="User",
                 content=prompt,
-                video_bytes=video_bytes,
+                image_list=frames,
+                image_detail="low",
             )
+            # Qwen VL models can over-weight the final frame when a long image
+            # sequence follows the question. Keep normal image-message behavior
+            # unchanged, but place the video question after its sampled frames.
+            user_msg.media_before_text = True
 
             response = agent.step(user_msg)
             agent.reset()
