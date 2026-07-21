@@ -57,6 +57,56 @@ def _capture_dir() -> Path | None:
     return Path(value).resolve() if value else None
 
 
+def _step3_tool_log() -> Path | None:
+    value = os.environ.get("STEP3_TOOL_LOG")
+    return Path(value).resolve() if value else None
+
+
+def _append_step3_primitive(
+    *,
+    name: str,
+    toolkit: str,
+    started_at_ns: int,
+    ended_at_ns: int,
+    error: str | None,
+) -> None:
+    """Append one completed primitive to Owl's Step 3 tool lane.
+
+    Step 3 consumes the same compact schema emitted by FunctionTool, but records
+    an interval only after the primitive completes.  A single os.write keeps one
+    JSONL record intact when several GAIA worker processes share the log.
+    """
+
+    path = _step3_tool_log()
+    if path is None:
+        return
+    task_id = os.environ.get("OWL_T2T_TASK") or os.environ.get(
+        "AGENT_REPLAY_OWL_TASK_ID"
+    )
+    pid = os.getpid()
+    record = {
+        "tool": name,
+        "chain": f"{task_id or pid}/{toolkit}",
+        "task_id": task_id,
+        "pid": pid,
+        "call_id": f"{pid}-{started_at_ns}",
+        "phase": "end",
+        "ts_start": round(started_at_ns / 1_000_000_000, 3),
+        "ts_end": round(ended_at_ns / 1_000_000_000, 3),
+        "success": error is None,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # instrumentation must never break a workload
+
+
 def append_record(record: dict[str, Any]) -> None:
     root = _capture_dir()
     if root is None:
@@ -123,9 +173,15 @@ def run_tool_primitive(
     toolkit: str,
     record_result: Callable[[T], Any] | None = None,
 ) -> T:
-    """Execute and capture one synchronous model-free replay primitive."""
+    """Execute and capture one synchronous model-free primitive.
 
-    if _capture_dir() is None or not _capture_tool.get():
+    Agent-replay stores the full invocation/output record. Step 3 stores only
+    the timing identity needed by the shared tool timeline.
+    """
+
+    capture_replay = _capture_dir() is not None and _capture_tool.get()
+    capture_step3 = _step3_tool_log() is not None
+    if not capture_replay and not capture_step3:
         return function()
     started_at_ns = time.time_ns()
     tool_token = _tool_name.set(name)
@@ -135,7 +191,8 @@ def run_tool_primitive(
     error: str | None = None
     try:
         result = function()
-        captured_result = record_result(result) if record_result else result
+        if capture_replay:
+            captured_result = record_result(result) if record_result else result
         return result
     except BaseException as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -143,20 +200,30 @@ def run_tool_primitive(
     finally:
         _allow_nested_models.reset(allow_token)
         _tool_name.reset(tool_token)
-        append_record(
-            {
-                "kind": "function_tool.call",
-                "capture_id": uuid.uuid4().hex,
-                "actor_id": _actor_id(_actor.get()),
-                "toolkit": toolkit,
-                "invocation": {"name": name, "arguments": arguments},
-                "status": "error" if error else "success",
-                "output": captured_result,
-                "error": error,
-                "started_at_ns": started_at_ns,
-                "ended_at_ns": time.time_ns(),
-            }
-        )
+        ended_at_ns = time.time_ns()
+        if capture_replay:
+            append_record(
+                {
+                    "kind": "function_tool.call",
+                    "capture_id": uuid.uuid4().hex,
+                    "actor_id": _actor_id(_actor.get()),
+                    "toolkit": toolkit,
+                    "invocation": {"name": name, "arguments": arguments},
+                    "status": "error" if error else "success",
+                    "output": captured_result,
+                    "error": error,
+                    "started_at_ns": started_at_ns,
+                    "ended_at_ns": ended_at_ns,
+                }
+            )
+        if capture_step3:
+            _append_step3_primitive(
+                name=name,
+                toolkit=toolkit,
+                started_at_ns=started_at_ns,
+                ended_at_ns=ended_at_ns,
+                error=error,
+            )
 
 
 def record_unreplayable_model_call(
@@ -197,26 +264,37 @@ def record_browser_primitive(
     unsupported record so the recording builder fails closed.
     """
 
-    if _capture_dir() is None or not _capture_tool.get():
+    capture_replay = _capture_dir() is not None and _capture_tool.get()
+    capture_step3 = _step3_tool_log() is not None
+    if not capture_replay and not capture_step3:
         return
-    append_record(
-        {
-            "kind": (
-                "function_tool.call"
-                if replayable
-                else "browser.primitive.unreplayable"
-            ),
-            "capture_id": uuid.uuid4().hex,
-            "actor_id": _actor_id(_actor.get()),
-            "toolkit": "AsyncBrowserPrimitive",
-            "invocation": {"name": name, "arguments": arguments},
-            "status": "error" if error else "success",
-            "output": result,
-            "error": error,
-            "started_at_ns": started_at_ns,
-            "ended_at_ns": ended_at_ns,
-        }
-    )
+    if capture_replay:
+        append_record(
+            {
+                "kind": (
+                    "function_tool.call"
+                    if replayable
+                    else "browser.primitive.unreplayable"
+                ),
+                "capture_id": uuid.uuid4().hex,
+                "actor_id": _actor_id(_actor.get()),
+                "toolkit": "AsyncBrowserPrimitive",
+                "invocation": {"name": name, "arguments": arguments},
+                "status": "error" if error else "success",
+                "output": result,
+                "error": error,
+                "started_at_ns": started_at_ns,
+                "ended_at_ns": ended_at_ns,
+            }
+        )
+    if capture_step3:
+        _append_step3_primitive(
+            name=name,
+            toolkit="AsyncBrowserPrimitive",
+            started_at_ns=started_at_ns,
+            ended_at_ns=ended_at_ns,
+            error=error,
+        )
 
 
 class OpenAIReplayCapture:

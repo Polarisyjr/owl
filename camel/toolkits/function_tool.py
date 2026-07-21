@@ -32,19 +32,21 @@ from camel.models import BaseModelBackend, ModelFactory
 from camel.types import ModelPlatformType, ModelType
 from camel.utils import get_pydantic_object_schema, to_pascal
 from camel.utils.replay_capture import record_tool as _replay_record_tool
+from camel.utils.tool_contract import capture_outer_tool
 
 logger = logging.getLogger(__name__)
 
 
 # --- step3 tool-attribution lane (opt-in via env) --------------------------
-# When STEP3_TOOL_LOG points at a file, every tool execution appends start/end
-# JSONL records carrying {call_id, ts_start, ts_end, tool, chain, task_id, ...}.
+# When STEP3_TOOL_LOG points at a file, every *outer replayable* tool execution
+# appends start/end JSONL records carrying
+# {call_id, ts_start, ts_end, tool, chain, task_id, ...}.
 # Start records let the harvester retain a tool interrupted by a task timeout.
-# This is the owl
-# analog of trae's option-A test-run instrumentation: FunctionTool.__call__ /
-# .async_call are the single choke point every toolkit call passes through, so
-# the whole GAIA workforce's off-GPU tool work becomes a timeline lane without
-# touching any toolkit. No-op (near-zero cost) when the env var is unset.
+# Orchestration/model boundaries such as browse_url and
+# extract_document_content are deliberately excluded here: their model-free
+# browser/document/video primitives write their finer-grained intervals through
+# camel.utils.replay_capture. This avoids double-counting one long outer bar and
+# all of its nested primitives. No-op when the env var is unset.
 def _step3_tool_name(func: Callable) -> str:
     return getattr(func, "__name__", None) or repr(func)
 
@@ -124,8 +126,10 @@ def _step3_log_tool(
     _step3_append_tool_record(rec)
 
 
-def _step3_enabled() -> bool:
-    return bool(_os.environ.get("STEP3_TOOL_LOG"))
+def _step3_enabled(func: Callable) -> bool:
+    return bool(_os.environ.get("STEP3_TOOL_LOG")) and capture_outer_tool(
+        _step3_tool_name(func)
+    )
 
 
 def _remove_a_key(d: Dict, remove_key: Any) -> None:
@@ -484,7 +488,7 @@ class FunctionTool:
             return result
         else:
             # Pass the extracted arguments to the indicated function
-            t0 = _time.time() if _step3_enabled() else None
+            t0 = _time.time() if _step3_enabled(self.func) else None
             replay_t0 = _time.time_ns()
             call_id = f"{_os.getpid()}-{replay_t0}"
             if t0 is not None:
@@ -522,7 +526,7 @@ class FunctionTool:
         if self.synthesize_output:
             result = self.synthesize_execution_output(args, kwargs)
             return result
-        t0 = _time.time() if _step3_enabled() else None
+        t0 = _time.time() if _step3_enabled(self.func) else None
         replay_t0 = _time.time_ns()
         call_id = f"{_os.getpid()}-{replay_t0}"
         if t0 is not None:
