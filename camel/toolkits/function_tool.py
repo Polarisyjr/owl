@@ -98,7 +98,7 @@ def _step3_log_tool_start(
         {
             "call_id": call_id,
             "phase": "start",
-            "ts_start": round(t0, 3),
+            "ts_start": t0,
             "ts_end": None,
             "success": None,
         }
@@ -118,8 +118,8 @@ def _step3_log_tool(
         {
             "call_id": call_id,
             "phase": "end",
-            "ts_start": round(t0, 3),
-            "ts_end": round(t1, 3),
+            "ts_start": t0,
+            "ts_end": t1,
             "success": ok,
         }
     )

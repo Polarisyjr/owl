@@ -24,11 +24,11 @@ TOOL_EXECUTION_CONTRACTS: dict[str, ToolExecutionKind] = {
     "browse_url": "orchestration",
     "extract_document_content": "orchestration",
     "web_search": "orchestration",
+    "ask_question_about_audio": "orchestration",
     # These names are model inference capabilities, even though CAMEL exposes
     # them through FunctionTool for normal Agent operation.
     "image_to_text": "model",
     "ask_question_about_image": "model",
-    "ask_question_about_audio": "model",
     "ask_question_about_video": "model",
     # Replayable, model-free primitives.
     "browser_open": "deterministic_tool",
@@ -37,6 +37,7 @@ TOOL_EXECUTION_CONTRACTS: dict[str, ToolExecutionKind] = {
     "browser_close": "deterministic_tool",
     "document_extract_raw": "external_tool",
     "document_select_chunks": "deterministic_tool",
+    "audio_transcription": "external_tool",
     "video_download": "external_tool",
     "video_extract_frames": "deterministic_tool",
     "execute_code": "deterministic_tool",

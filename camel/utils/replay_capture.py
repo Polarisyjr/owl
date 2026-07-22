@@ -91,8 +91,8 @@ def _append_step3_primitive(
         "pid": pid,
         "call_id": f"{pid}-{started_at_ns}",
         "phase": "end",
-        "ts_start": round(started_at_ns / 1_000_000_000, 3),
-        "ts_end": round(ended_at_ns / 1_000_000_000, 3),
+        "ts_start": started_at_ns / 1_000_000_000,
+        "ts_end": ended_at_ns / 1_000_000_000,
         "success": error is None,
     }
     try:

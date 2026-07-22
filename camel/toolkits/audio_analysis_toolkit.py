@@ -12,13 +12,11 @@
 # limitations under the License.
 # ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
 
-import base64
 import os
 from typing import List, Optional
 from urllib.parse import urlparse
 
 
-import openai
 import requests
 from pydub.utils import mediainfo
 
@@ -51,15 +49,6 @@ class AudioAnalysisToolkit(BaseToolkit):
         self._whisper_model_size = whisper_model_size
         self._whisper_device_index = whisper_device_index  # None → faster-whisper default (cuda:0)
         self._whisper_model = None  # lazy: load only when transcribing
-        self._openai_client = None  # lazy: only used by the gpt-4o-audio fallback branch
-
-    @property
-    def client(self):
-        """Lazy OpenAI client. Only required by the (paid) gpt-4o-audio
-        fallback branch when no audio_reasoning_model is provided."""
-        if self._openai_client is None:
-            self._openai_client = openai.OpenAI()
-        return self._openai_client
 
     def _get_whisper(self):
         """Lazy-load a faster-whisper model on first use."""
@@ -112,16 +101,33 @@ class AudioAnalysisToolkit(BaseToolkit):
 
     def _transcribe_local(self, audio_path: str) -> str:
         """Transcribe audio with faster-whisper (free, local)."""
-        from camel.utils.replay_capture import record_unreplayable_model_call
-
-        record_unreplayable_model_call(
-            name="audio_transcription",
-            provider="faster-whisper",
-            details={"model": self._whisper_model_size},
-        )
         model = self._get_whisper()
         segments, _info = model.transcribe(audio_path, beam_size=5)
         return " ".join(seg.text.strip() for seg in segments)
+
+    def transcribe_audio(self, audio_path: str) -> dict:
+        """Run the replayable audio primitive without any reasoning LLM.
+
+        URL resolution, duration probing, and faster-whisper execution form one
+        external-tool interval.  ``ask_question_about_audio`` orchestrates this
+        primitive and a separate reasoning-model request, just as the browser
+        orchestration separates browser primitives from planning/web LLM calls.
+        """
+        from camel.utils.replay_capture import run_tool_primitive
+
+        def transcribe() -> dict:
+            local_audio_path = self._ensure_local_path(audio_path)
+            return {
+                "transcript": self._transcribe_local(local_audio_path),
+                "duration_s": self.get_audio_duration(local_audio_path),
+            }
+
+        return run_tool_primitive(
+            name="audio_transcription",
+            arguments={"audio_path": audio_path},
+            function=transcribe,
+            toolkit=type(self).__name__,
+        )
 
     @staticmethod
     def get_audio_duration(file_path: str) -> float:
@@ -146,13 +152,11 @@ class AudioAnalysisToolkit(BaseToolkit):
             `{audio_path}` and question `{question}`."
         )
 
-        # Normalize URL → local file once, then reuse for transcription / encoding / duration
-        local_audio_path = self._ensure_local_path(audio_path)
-        duration = self.get_audio_duration(local_audio_path)
+        audio = self.transcribe_audio(audio_path)
+        transcript = str(audio["transcript"])
+        duration = float(audio["duration_s"])
 
         if self.audio_reasoning_model:
-            transcript = self._transcribe_local(local_audio_path)
-
             reasoning_prompt = f"""
             <speech_transcription_result>{transcript}</speech_transcription_result>
 
@@ -173,46 +177,14 @@ class AudioAnalysisToolkit(BaseToolkit):
             return response
 
 
-        else:
-            # ── Paid fallback: gpt-4o-mini-audio-preview ──
-            with open(local_audio_path, "rb") as f:
-                audio_data = f.read()
-            encoded_string = base64.b64encode(audio_data).decode("utf-8")
-            file_format = os.path.splitext(local_audio_path)[1][1:]
-
-            text_prompt = f"""Answer the following question based on the given \
-            audio information:\n\n{question}"""
-
-            completion = self.client.chat.completions.create(
-                # model="gpt-4o-audio-preview",
-                model = "gpt-4o-mini-audio-preview",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant specializing in \
-                        audio analysis.",
-                    },
-                    {  # type: ignore[list-item, misc]
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": text_prompt},
-                            {
-                                "type": "input_audio",
-                                "input_audio": {
-                                    "data": encoded_string,
-                                    "format": file_format,
-                                },
-                            },
-                        ],
-                    },
-                ],
-            )  # type: ignore[misc]
-
-            response: str = str(completion.choices[0].message.content)
-            response += f"\n\nAudio duration: {duration} seconds"
-
-            logger.debug(f"Response: {response}")
-            return response
+        # No nested reasoning model: return the tool observation to the calling
+        # agent, whose normal LLM turn can answer ``question`` from the transcript.
+        response = (
+            f"Speech transcription:\n{transcript}\n\n"
+            f"Audio duration: {duration} seconds"
+        )
+        logger.debug(f"Response: {response}")
+        return response
         
 
     def get_tools(self) -> List[FunctionTool]:

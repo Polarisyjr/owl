@@ -4,7 +4,11 @@ import json
 import os
 
 from camel.toolkits.function_tool import _step3_enabled
-from camel.utils.replay_capture import record_browser_primitive, run_tool_primitive
+from camel.utils.replay_capture import (
+    record_browser_primitive,
+    run_tool_primitive,
+)
+from camel.toolkits.audio_analysis_toolkit import AudioAnalysisToolkit
 
 
 def _events(path):
@@ -22,7 +26,11 @@ def test_step3_replaces_orchestration_boundary_with_primitives(
     def search_wiki():
         pass
 
+    def ask_question_about_audio():
+        pass
+
     assert _step3_enabled(browse_url) is False
+    assert _step3_enabled(ask_question_about_audio) is False
     assert _step3_enabled(search_wiki) is True
 
 
@@ -77,3 +85,39 @@ def test_generic_primitive_writes_step3_without_replay_capture(
     assert event["chain"].endswith("/DocumentProcessingPrimitive")
     assert event["ts_end"] >= event["ts_start"]
     assert event["success"] is True
+
+
+def test_audio_orchestration_records_transcription_as_real_tool(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "tool_events_raw.jsonl"
+    replay = tmp_path / "replay"
+    monkeypatch.setenv("STEP3_TOOL_LOG", str(output))
+    monkeypatch.setenv("AGENT_REPLAY_OWL_CAPTURE_DIR", str(replay))
+    monkeypatch.setenv("OWL_T2T_TASK", "audio-task")
+
+    toolkit = AudioAnalysisToolkit(cache_dir=str(tmp_path / "cache"))
+    monkeypatch.setattr(toolkit, "_ensure_local_path", lambda path: path)
+    monkeypatch.setattr(toolkit, "_transcribe_local", lambda path: "hello world")
+    monkeypatch.setattr(toolkit, "get_audio_duration", lambda path: 1.25)
+
+    assert toolkit.transcribe_audio("sample.wav") == {
+        "transcript": "hello world",
+        "duration_s": 1.25,
+    }
+
+    event = _events(output)[0]
+    assert event["tool"] == "audio_transcription"
+    assert event["chain"] == "audio-task/AudioAnalysisToolkit"
+    assert event["ts_end"] >= event["ts_start"]
+    assert event["success"] is True
+    replay_event = _events(next(replay.glob("events.*.jsonl")))[0]
+    assert replay_event["kind"] == "function_tool.call"
+    assert replay_event["invocation"] == {
+        "name": "audio_transcription",
+        "arguments": {"audio_path": "sample.wav"},
+    }
+    assert replay_event["output"] == {
+        "transcript": "hello world",
+        "duration_s": 1.25,
+    }

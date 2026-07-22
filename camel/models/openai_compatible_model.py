@@ -54,13 +54,24 @@ logger = get_logger(__name__)
 _T2T_LOCK = threading.Lock()
 
 
-def _record_t2t(model_type: Any, latency_s: float, response: Any) -> None:
+def _record_t2t(
+    model_type: Any,
+    latency_s: float,
+    response: Any,
+    ts_start_ns: int,
+    ts_end_ns: int,
+) -> None:
     path = os.environ.get("OWL_T2T_LOG")
     if not path:
         return
     usage = getattr(response, "usage", None)  # None for streaming responses
     row = {
-        "ts": time.time(),
+        # Retain `ts` as a compatibility alias for the response-end timestamp.
+        # The nanosecond-derived endpoints avoid throwing away small overheads
+        # when Step3 aligns this client interval with the OTLP server span.
+        "ts": ts_end_ns / 1e9,
+        "ts_start": ts_start_ns / 1e9,
+        "ts_end": ts_end_ns / 1e9,
         "pid": os.getpid(),                          # worker process (concurrency slot)
         "task_id": os.environ.get("OWL_T2T_TASK"),   # this worker's current GAIA task
         "t2t_latency_s": latency_s,
@@ -195,13 +206,17 @@ class OpenAICompatibleModel(BaseModelBackend):
         if tools:
             request_config["tools"] = tools
 
+        ts_start_ns = time.time_ns()
         t0 = time.monotonic()
         response = self._client.chat.completions.create(
             messages=messages,
             model=self.model_type,
             **request_config,
         )
-        _record_t2t(self.model_type, time.monotonic() - t0, response)
+        latency_s = time.monotonic() - t0
+        _record_t2t(
+            self.model_type, latency_s, response, ts_start_ns, time.time_ns()
+        )
         return response
 
     async def _arequest_chat_completion(
@@ -214,13 +229,17 @@ class OpenAICompatibleModel(BaseModelBackend):
         if tools:
             request_config["tools"] = tools
 
+        ts_start_ns = time.time_ns()
         t0 = time.monotonic()
         response = await self._async_client.chat.completions.create(
             messages=messages,
             model=self.model_type,
             **request_config,
         )
-        _record_t2t(self.model_type, time.monotonic() - t0, response)
+        latency_s = time.monotonic() - t0
+        _record_t2t(
+            self.model_type, latency_s, response, ts_start_ns, time.time_ns()
+        )
         return response
 
     def _request_parse(
