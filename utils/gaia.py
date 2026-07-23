@@ -94,13 +94,16 @@ class GAIABenchmark(BaseBenchmark):
         r"""Load the GAIA dataset.
 
         Resolution order (first hit wins):
-          1. ``GAIA_USE_CURATED=1`` env → curated file-less subset at
+          1. ``GAIA_USE_CURATED=1`` env → curated file-less data at
              ``<owl_root>/tasks/level_{1,2,3}_tasks.json``.
           2. Upstream HF parquet at ``{data_dir}/2023/{validation,test}/metadata.parquet``
-             (current HF format; 165 valid / 301 test, with file attachments).
+             (current HF format; includes file attachments).
           3. Upstream HF jsonl at ``.../metadata.jsonl`` (legacy format).
-          4. Curated subset (final fallback).
-          5. Download from HF, then re-resolve.
+          4. Download the upstream ``gaia-benchmark/GAIA`` dataset from HF and
+             re-resolve it.
+
+        Curated data is strictly opt-in. A normal run never falls back to it
+        when the upstream data is absent or a download fails.
 
         Args:
             force_download (bool, optional): Force a fresh HF download even
@@ -167,35 +170,47 @@ class GAIABenchmark(BaseBenchmark):
                     self._data["valid"].append(t)
             return True
 
-        if force_download:
-            logger.info("Force downloading data.")
-            self.download()
-
         # 1. explicit curated override
         if os.environ.get("GAIA_USE_CURATED") == "1":
             if _read_curated():
                 return self
-            logger.warning("GAIA_USE_CURATED=1 but curated files missing; falling through.")
+            raise FileNotFoundError(
+                f"GAIA_USE_CURATED=1 but curated files are missing under "
+                f"{curated_root}"
+            )
 
-        # 2-3. upstream parquet/jsonl per split
-        for path, label in [(valid_dir, "valid"), (test_dir, "test")]:
-            if not (_read_parquet_split(path, label) or _read_jsonl_split(path, label)):
-                self._data[label] = []  # empty split is OK; only one of valid/test may exist
+        def _read_upstream() -> bool:
+            for path, label in [(valid_dir, "valid"), (test_dir, "test")]:
+                if not (
+                    _read_parquet_split(path, label)
+                    or _read_jsonl_split(path, label)
+                ):
+                    # Only one split may be installed locally.
+                    self._data[label] = []
+            return bool(self._data.get("valid") or self._data.get("test"))
 
-        if self._data.get("valid") or self._data.get("test"):
+        if force_download:
+            logger.info("Force downloading upstream GAIA data from Hugging Face.")
+            self.download()
+        # 2-3. use a complete upstream HF checkout when it is already present,
+        # including the checkout just refreshed by force_download.
+        if _read_upstream():
+            logger.info(f"Loading upstream GAIA data from {self.data_dir}")
             return self
 
-        # 4. curated fallback (no upstream data)
-        if _read_curated():
+        # 4. fetch the real dataset. Never substitute curated data implicitly.
+        if not force_download:
+            logger.info(
+                "Upstream GAIA data not found. Downloading it from Hugging Face."
+            )
+            self.download()
+        if _read_upstream():
+            logger.info(f"Loading upstream GAIA data from {self.data_dir}")
             return self
-
-        # 5. last resort: download then retry parquet/jsonl
-        logger.info("Data not found. Downloading data.")
-        self.download()
-        for path, label in [(valid_dir, "valid"), (test_dir, "test")]:
-            if not (_read_parquet_split(path, label) or _read_jsonl_split(path, label)):
-                self._data[label] = []
-        return self
+        raise FileNotFoundError(
+            "The upstream gaia-benchmark/GAIA download completed without a "
+            f"readable metadata.parquet or metadata.jsonl under {self.data_dir}"
+        )
     
     
     def _load_results_from_file(self, file_path: str) -> List[Dict[str, Any]]:
