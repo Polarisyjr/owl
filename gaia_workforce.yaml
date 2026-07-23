@@ -30,7 +30,14 @@ roles:
   audio:            { port: 8004, gpus: [4] }   # share with document
 
   # Multimodal endpoint — image / video / browser_web all share one VL server
-  browser_web:      { port: 8006, gpus: [6] }
+  # Browser observations should produce one compact JSON action. In the C8
+  # source run, all 87 completed calls used <=273 output tokens; cap runaway
+  # generations while retaining generous headroom for unusual actions.
+  browser_web:
+    port: 8006
+    gpus: [6]
+    extra_config:
+      max_tokens: 4096
   image:            { port: 8006, gpus: [6] }
   video:            { port: 8006, gpus: [6] }
 
