@@ -188,8 +188,14 @@ class DocumentProcessingToolkit(BaseToolkit):
                 headers=self.headers,
                 timeout=(5, 10),
             )
+            detected_parser = self._parser_from_response_metadata(response)
+            if (
+                response.status_code in {401, 403, 429}
+                and detected_parser == "webpage"
+            ):
+                return "webpage"
             response.raise_for_status()
-            head_parser = self._parser_from_response_metadata(response)
+            head_parser = detected_parser
             # A non-HTML media type or a recognized suffix is sufficiently
             # specific. HTML gets confirmed with GET because it may be a
             # transient challenge page.
@@ -208,6 +214,12 @@ class DocumentProcessingToolkit(BaseToolkit):
                 stream=True,
                 timeout=(5, 15),
             ) as response:
+                response_parser = self._parser_from_response_metadata(response)
+                if (
+                    response.status_code in {401, 403, 429}
+                    and response_parser == "webpage"
+                ):
+                    return "webpage"
                 response.raise_for_status()
                 prefix = b""
                 for chunk in response.iter_content(chunk_size=1024):
@@ -220,7 +232,6 @@ class DocumentProcessingToolkit(BaseToolkit):
                 if b"%PDF-" in prefix:
                     return "pdf"
 
-                response_parser = self._parser_from_response_metadata(response)
                 if response_parser is not None:
                     return response_parser
 
@@ -556,17 +567,25 @@ Query:
         if not api_key:
             try:
                 text = self._extract_webpage_content_with_html2text(url)
-                if self._looks_like_challenge(text):
-                    logger.warning(
-                        f"html2text got a challenge/empty page for {url}; "
-                        f"retrying via headless browser")
-                    return self._extract_webpage_content_with_browser(url)
-                return text
             except Exception as e:
                 logger.warning(
                     f"html2text failed for {url} ({type(e).__name__}: {e}); "
                     f"falling back to headless browser")
-                return self._extract_webpage_content_with_browser(url)
+            else:
+                if not self._looks_like_challenge(text):
+                    return text
+                logger.warning(
+                    f"html2text got a challenge/empty page for {url}; "
+                    f"retrying via headless browser"
+                )
+
+            browser_text = self._extract_webpage_content_with_browser(url)
+            if self._looks_like_challenge(browser_text):
+                raise requests.RequestException(
+                    "Bot-protection challenge remained after browser "
+                    f"fallback for {url}"
+                )
+            return browser_text
 
         try:
             from firecrawl import FirecrawlApp
@@ -625,8 +644,10 @@ Query:
             
             return file_path
 
-        except requests.exceptions.RequestException as e:
-            print(f"Error downloading the file: {e}")
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Failed to download {url}: {exc}"
+            ) from exc
 
 
     def _get_formatted_time(self) -> str:
