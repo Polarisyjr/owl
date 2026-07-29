@@ -43,6 +43,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -688,6 +689,154 @@ def _run_gaia_parallel(
     return benchmark._generate_summary()
 
 
+def _run_gaia_recorded_slots(
+    benchmark: GAIABenchmark,
+    *,
+    tasks: List[Dict[str, Any]],
+    max_tries: int,
+    max_replanning_tries: int,
+    max_workers: int,
+    wall_s: float,
+) -> Dict[str, Any]:
+    """Replay each recorded process slot from its own ordered task queue."""
+
+    from minireplay.slot_scheduler import load_required_plan, run_recorded_slot_futures
+
+    plan = load_required_plan(adapter="owl", concurrency=max_workers)
+    tasks_by_id = {str(task["task_id"]): task for task in tasks}
+    plan.require_tasks(tasks_by_id)
+    events_path = os.environ.get("GAIA_QUEUE_EVENTS_PATH")
+    correct = total = refill_count = 0
+    seen: Dict[str, Any] = {}
+    last_log = time.monotonic()
+
+    def queue_event(kind: str, **fields: Any) -> None:
+        if not events_path:
+            return
+        path = Path(events_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps({
+                "event": kind,
+                "ts_epoch": time.time(),
+                "target_concurrency": max_workers,
+                **fields,
+            }, sort_keys=True) + "\n")
+
+    def on_complete(slot_task, future, active: int) -> None:
+        nonlocal correct, total
+        try:
+            result = future.result()
+        except Exception as exc:
+            logger.error(
+                f"[recorded-slots] worker exception for "
+                f"{slot_task.source_actor_id}: {exc}"
+            )
+            queue_event(
+                "worker_error",
+                running=active,
+                refill_count=refill_count,
+                slot_id=slot_task.slot_id,
+                source_actor_id=slot_task.source_actor_id,
+                exception_type=type(exc).__name__,
+                error=str(exc),
+            )
+        else:
+            if result is not None:
+                total += 1
+                if result.get("score"):
+                    correct += 1
+                task_id = result.get("task_id")
+                if task_id is not None and task_id not in seen:
+                    seen[task_id] = result
+                    benchmark._save_results_to_file(
+                        list(seen.values()), benchmark.save_to
+                    )
+        queue_event(
+            "task_end",
+            running=active,
+            refill_count=refill_count,
+            slot_id=slot_task.slot_id,
+            source_actor_id=slot_task.source_actor_id,
+        )
+
+    def on_refill(slot_task, active: int) -> None:
+        nonlocal refill_count
+        refill_count += 1
+        queue_event(
+            "refill",
+            running=active,
+            refill_count=refill_count,
+            slot_id=slot_task.slot_id,
+            source_actor_id=slot_task.source_actor_id,
+        )
+
+    def on_poll(active: int) -> None:
+        nonlocal last_log
+        if time.monotonic() - last_log < 30:
+            return
+        logger.info(
+            f"[recorded-slots] {active} active slot(s), "
+            f"{total} task-runs done ({correct} correct)"
+        )
+        queue_event(
+            "heartbeat",
+            running=active,
+            refill_count=refill_count,
+            completed=total,
+        )
+        last_log = time.monotonic()
+
+    logger.info(
+        f"[recorded-slots] replaying {sum(len(slot.tasks) for slot in plan.slots)} "
+        f"task(s) in {len(plan.slots)} ordered slot(s)"
+    )
+    queue_event("queue_start", running=0, duration_s=wall_s)
+    ctx = mp.get_context("spawn")
+    with ExitStack() as stack:
+        executors = {
+            slot.slot_id: stack.enter_context(
+                ProcessPoolExecutor(
+                    max_workers=1,
+                    mp_context=ctx,
+                    initializer=_proc_init,
+                    initargs=(str(benchmark.data_dir), benchmark.save_to),
+                )
+            )
+            for slot in plan.slots
+        }
+
+        def submit(slot_task):
+            return executors[slot_task.slot_id].submit(
+                _proc_run_one,
+                tasks_by_id[slot_task.source_actor_id],
+                max_tries,
+                max_replanning_tries,
+            )
+
+        run_recorded_slot_futures(
+            plan,
+            submit=submit,
+            on_complete=on_complete,
+            on_filled=lambda active: queue_event(
+                "queue_filled",
+                running=active,
+                refill_count=refill_count,
+            ),
+            on_refill=on_refill,
+            poll_interval_s=10,
+            on_poll=on_poll,
+        )
+
+    queue_event("queue_stop", running=0, refill_count=refill_count, completed=total)
+    accuracy = correct / total if total else 0.0
+    logger.success(
+        f"[recorded-slots] done: {total} task-runs, "
+        f"{correct} correct, acc={accuracy:.3f}"
+    )
+    return {"correct": correct, "total": total, "accuracy": accuracy}
+
+
 def _run_gaia_steady(
     benchmark: GAIABenchmark,
     on: str,
@@ -713,6 +862,17 @@ def _run_gaia_steady(
     if not tasks:
         logger.warning("[steady] no tasks resolved; nothing to run")
         return {"correct": 0, "total": 0, "accuracy": 0.0}
+    if os.environ.get("NATIVE_REPLAY_MODE") == "replay":
+        if os.environ.get("NATIVE_REPLAY_REFILL") != "1":
+            raise RuntimeError("Owl steady replay requires NATIVE_REPLAY_REFILL=1")
+        return _run_gaia_recorded_slots(
+            benchmark,
+            tasks=tasks,
+            max_tries=max_tries,
+            max_replanning_tries=max_replanning_tries,
+            max_workers=max_workers,
+            wall_s=wall_s,
+        )
 
     from itertools import cycle as _cycle
     queue = _cycle(tasks)
