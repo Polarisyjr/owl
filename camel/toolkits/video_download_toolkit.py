@@ -92,8 +92,9 @@ class VideoDownloaderToolkit(BaseToolkit):
     Args:
         download_directory (Optional[str], optional): The directory where the
             video will be downloaded to. If not provided, video will be stored
-            in a temporary directory and will be cleaned up after use.
-            (default: :obj:`None`)
+            in a unique directory under ``OWL_TMP_DIR`` or the Owl project's
+            ``tmp`` directory, then cleaned up after use. (default:
+            :obj:`None`)
         cookies_path (Optional[str], optional): The path to the cookies file
             for the video service in Netscape format. (default: :obj:`None`)
         cookies_from_browser (Optional[str], optional): A live browser profile
@@ -124,9 +125,20 @@ class VideoDownloaderToolkit(BaseToolkit):
             else None
         )
 
-        self._download_directory = Path(
-            download_directory or tempfile.mkdtemp()
-        ).resolve()
+        if download_directory is None:
+            temp_root = Path(
+                os.environ.get(
+                    "OWL_TMP_DIR",
+                    Path(__file__).resolve().parents[2] / "tmp",
+                )
+            ).expanduser()
+            temp_root.mkdir(parents=True, exist_ok=True)
+            download_directory = tempfile.mkdtemp(
+                prefix="video-download-",
+                dir=temp_root,
+            )
+
+        self._download_directory = Path(download_directory).resolve()
 
         try:
             self._download_directory.mkdir(parents=True, exist_ok=True)
@@ -189,9 +201,8 @@ class VideoDownloaderToolkit(BaseToolkit):
             ".youtube.com"
         )
         ydl_opts = {
-            # Some YouTube clients expose DASH URLs that pass extraction but
-            # return 403 when fetched. Prefer the combined HLS rendition there;
-            # retain yt-dlp's normal best-video/audio fallback everywhere.
+            # Prefer HLS when a YouTube client exposes it. The DASH fallback is
+            # usable when the launcher supplies a PO-token-enabled client.
             'format': (
                 'best[protocol^=m3u8][language^=en]/'
                 'best[protocol^=m3u8]/bestvideo+bestaudio/best'
@@ -199,7 +210,6 @@ class VideoDownloaderToolkit(BaseToolkit):
                 else 'bestvideo+bestaudio/best'
             ),
             'outtmpl': str(video_template),
-            'force_generic_extractor': True,
             # yt-dlp updates its cookie jar in place. Always give it a private
             # per-call copy so authenticated source cookies stay immutable and
             # concurrent workers cannot corrupt each other's sessions.
@@ -247,7 +257,14 @@ class VideoDownloaderToolkit(BaseToolkit):
                 info = ydl.extract_info(url, download=True)
                 return ydl.prepare_filename(info)
         except yt_dlp.utils.DownloadError as e:
-            raise RuntimeError(f"Failed to download video from {url}: {e}")
+            detail = str(e)
+            if is_youtube and "HTTP Error 403" in detail:
+                detail += (
+                    ". YouTube rejected the media URL; verify that the "
+                    "PO-token provider is running and the mweb player client "
+                    "is configured."
+                )
+            raise RuntimeError(f"Failed to download video from {url}: {detail}")
         finally:
             if cookie_copy is not None:
                 cookie_copy.unlink(missing_ok=True)
