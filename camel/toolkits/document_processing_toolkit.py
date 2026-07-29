@@ -6,7 +6,6 @@ from camel.types import ModelType, ModelPlatformType
 from camel.agents import ChatAgent
 from docx2markdown._docx_to_markdown import docx_to_markdown
 import requests
-import mimetypes
 import json
 from retry import retry
 from typing import Any, List, Optional, Tuple
@@ -89,8 +88,159 @@ class DocumentProcessingToolkit(BaseToolkit):
         if suffix in parsers:
             return parsers[suffix]
         if parsed.scheme in {"http", "https"} and parsed.netloc:
-            return "webpage" if self._is_webpage(document_path) else "generic"
+            return self._probe_remote_parser(document_path)
         return "generic"
+
+    @staticmethod
+    def _parser_from_content_type(content_type: str) -> Optional[str]:
+        """Map an HTTP media type to one of the explicit document parsers."""
+
+        media_type = content_type.partition(";")[0].strip().lower()
+        if not media_type:
+            return None
+        if media_type == "application/pdf":
+            return "pdf"
+        if media_type in {"text/html", "application/xhtml+xml"}:
+            return "webpage"
+        if media_type.startswith("image/"):
+            return "image"
+        if media_type.startswith("audio/"):
+            return "audio"
+        if media_type in {"text/plain", "text/x-python"}:
+            return "text"
+        if media_type in {
+            "application/json",
+            "application/ld+json",
+            "application/x-ndjson",
+        }:
+            return "json"
+        if media_type in {"application/xml", "text/xml"}:
+            return "xml"
+        if media_type in {
+            "application/zip",
+            "application/x-zip-compressed",
+        }:
+            return "zip"
+        if media_type in {
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "text/csv",
+        }:
+            return "excel"
+        if media_type == (
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ):
+            return "docx"
+        if media_type == (
+            "application/vnd.openxmlformats-officedocument."
+            "presentationml.presentation"
+        ):
+            return "pptx"
+        return None
+
+    def _parser_from_response_metadata(self, response: requests.Response) -> Optional[str]:
+        """Infer a parser from a response's final URL and Content-Type."""
+
+        final_path = urlparse(response.url).path
+        suffix = os.path.splitext(final_path)[1].lower()
+        suffix_parsers = {
+            ".jpg": "image",
+            ".jpeg": "image",
+            ".png": "image",
+            ".mp3": "audio",
+            ".wav": "audio",
+            ".txt": "text",
+            ".xls": "excel",
+            ".xlsx": "excel",
+            ".csv": "excel",
+            ".zip": "zip",
+            ".json": "json",
+            ".jsonl": "json",
+            ".jsonld": "json",
+            ".py": "python",
+            ".xml": "xml",
+            ".docx": "docx",
+            ".pptx": "pptx",
+            ".pdf": "pdf",
+        }
+        if suffix in suffix_parsers:
+            return suffix_parsers[suffix]
+        return self._parser_from_content_type(
+            response.headers.get("Content-Type", "")
+        )
+
+    def _probe_remote_parser(self, url: str) -> str:
+        """Resolve extensionless remote documents without decoding bytes as HTML.
+
+        A HEAD response is useful but not authoritative: CDNs and bot-protection
+        pages can report ``text/html`` for a URL whose GET body is a PDF.  For an
+        ambiguous or HTML-looking HEAD response, inspect a small prefix of the
+        real GET response as well.  PDF magic wins over response metadata.
+        """
+
+        head_parser = None
+        head_error = None
+        try:
+            response = requests.head(
+                url,
+                allow_redirects=True,
+                headers=self.headers,
+                timeout=(5, 10),
+            )
+            response.raise_for_status()
+            head_parser = self._parser_from_response_metadata(response)
+            # A non-HTML media type or a recognized suffix is sufficiently
+            # specific. HTML gets confirmed with GET because it may be a
+            # transient challenge page.
+            if head_parser is not None and head_parser != "webpage":
+                return head_parser
+        except requests.RequestException as exc:
+            head_error = exc
+
+        probe_headers = dict(self.headers)
+        probe_headers["Range"] = "bytes=0-1023"
+        try:
+            with requests.get(
+                url,
+                allow_redirects=True,
+                headers=probe_headers,
+                stream=True,
+                timeout=(5, 15),
+            ) as response:
+                response.raise_for_status()
+                prefix = b""
+                for chunk in response.iter_content(chunk_size=1024):
+                    if chunk:
+                        prefix += chunk
+                    if len(prefix) >= 1024:
+                        break
+
+                # ISO 32000 permits the PDF header within the first 1024 bytes.
+                if b"%PDF-" in prefix:
+                    return "pdf"
+
+                response_parser = self._parser_from_response_metadata(response)
+                if response_parser is not None:
+                    return response_parser
+
+                normalized = prefix.lstrip().lower()
+                if normalized.startswith(
+                    (b"<!doctype html", b"<html", b"<?xml")
+                ):
+                    return "webpage"
+        except requests.RequestException as exc:
+            if head_error is not None:
+                logger.warning(
+                    f"Could not determine remote document type for {url}: "
+                    f"HEAD failed with {head_error}; GET probe failed with {exc}"
+                )
+            else:
+                logger.warning(
+                    f"Could not confirm remote document type for {url}: {exc}"
+                )
+
+        return head_parser or "generic"
 
     def extract_document_raw(
         self, document_path: str, parser: str
@@ -319,32 +469,10 @@ Query:
 
     def _is_webpage(self, url: str) -> bool:
         r"""Judge whether the given URL is a webpage."""
-        try:
-            parsed_url = urlparse(url)
-            is_url = all([parsed_url.scheme, parsed_url.netloc])
-            if not is_url:
-                return False
-
-            path = parsed_url.path
-            file_type, _ = mimetypes.guess_type(path)
-            if 'text/html' in file_type:
-                return True
-            
-            response = requests.head(url, allow_redirects=True, timeout=10)
-            content_type = response.headers.get("Content-Type", "").lower()
-            
-            if "text/html" in content_type:
-                return True
-            else:
-                return False
-        
-        except requests.exceptions.RequestException as e:
-            # raise RuntimeError(f"Error while checking the URL: {e}")
-            logger.warning(f"Error while checking the URL: {e}")
+        parsed_url = urlparse(url)
+        if not (parsed_url.scheme in {"http", "https"} and parsed_url.netloc):
             return False
-
-        except TypeError:
-            return True
+        return self._probe_remote_parser(url) == "webpage"
     
 
     # Bounded retry + explicit (connect, read) timeout. Without a timeout a
