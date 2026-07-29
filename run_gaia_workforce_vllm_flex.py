@@ -92,7 +92,10 @@ class VllmEndpoint:
 # All work products (tmp/, results/, data/, default config) are anchored to
 # the script's directory so the script behaves identically regardless of CWD.
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_TMP_DIR = _SCRIPT_DIR / "tmp"
+_TMP_DIR = Path(
+    os.environ.get("OWL_TMP_DIR") or (_SCRIPT_DIR / "tmp")
+).expanduser().resolve()
+_TMP_DIR.mkdir(parents=True, exist_ok=True)
 # Results dir is overridable so a sweep can isolate each setting under its own
 # <ts>-sweep/sweep_w<W>/ folder (CORAL-style) — separate folders mean no shared
 # answer file accumulates, so a later setting can't "resume"/skip another's tasks,
@@ -613,7 +616,10 @@ def _proc_run_one(
         # this task, but isolate concurrent tasks and remove their scratch data
         # when the task ends instead of polluting frameworks/owl.
         task_prefix = str(task["task_id"]).replace(os.sep, "_")[:16]
-        with tempfile.TemporaryDirectory(prefix=f"owl-gaia-{task_prefix}-") as workdir:
+        with tempfile.TemporaryDirectory(
+            prefix=f"owl-gaia-{task_prefix}-",
+            dir=_TMP_DIR,
+        ) as workdir:
             os.chdir(workdir)
             try:
                 return _proc_run_one_impl(task, max_tries, max_replanning_tries)

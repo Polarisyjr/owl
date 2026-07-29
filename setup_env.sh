@@ -13,7 +13,8 @@
 #   4. install chromium's system shared libraries (.so) via dnf or apt
 #   5. install fonts (Latin + CJK + emoji) so pages render glyphs, not tofu boxes
 #   6. install the ffmpeg CLI (often absent from base images) via conda-forge
-#   7. verify: chromium launches headless + ffmpeg is on PATH
+#   7. install and start the YouTube PO-token provider under HPCA/tmp
+#   8. verify: chromium, ffmpeg, and the token provider all work
 #
 # Requires passwordless sudo for steps 4 & 5.
 #
@@ -32,6 +33,7 @@ CONDA_ENV="${CONDA_ENV:-owl}"
 OWL_DIR="$(cd "$(dirname "$0")" && pwd)"     # this script lives in frameworks/owl
 ROOT="$(cd "$OWL_DIR/../.." && pwd)"
 REQ="$OWL_DIR/requirements.txt"
+YOUTUBE_POT_MANAGER="$ROOT/scripts/owl/youtube_pot_provider.sh"
 VERIFY_ONLY=0
 [ "${1:-}" = "--verify" ] && VERIFY_ONLY=1
 
@@ -131,6 +133,11 @@ if [ "$VERIFY_ONLY" = "0" ]; then
         "$CONDA_HOME/bin/conda" install -n "$CONDA_ENV" -c conda-forge ffmpeg -y
     fi
     ok "ffmpeg: $(conda_run bash -c 'command -v ffmpeg')"
+
+    say "7. YouTube PO-token provider"
+    [ -x "$YOUTUBE_POT_MANAGER" ] || die "provider manager not found: $YOUTUBE_POT_MANAGER"
+    "$YOUTUBE_POT_MANAGER" install
+    ok "provider installed under $ROOT/../tmp"
 fi
 
 # ---------------------------------------------------------------------------
@@ -162,5 +169,9 @@ PY
 # ffmpeg on PATH inside the env
 conda_run bash -c 'command -v ffmpeg >/dev/null && echo "  ok ffmpeg: $(ffmpeg -version 2>/dev/null | head -1)"' \
     || die "ffmpeg not on PATH in env $CONDA_ENV"
+
+[ -x "$YOUTUBE_POT_MANAGER" ] || die "provider manager not found: $YOUTUBE_POT_MANAGER"
+"$YOUTUBE_POT_MANAGER" ensure
+ok "YouTube PO-token provider ready"
 
 printf '\n\033[1;32mowl environment ready.\033[0m  Run a task with: bash %s/scripts/owl/start.sh\n' "$ROOT"
