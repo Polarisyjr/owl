@@ -15,6 +15,14 @@ token_limit: 120000
 # needs a GPU pin via the top-level `whisper_gpu` field.
 
 roles:
+  # NOTE: the text roles below carry no output ceiling, unlike the VL roles.
+  # Measured consequence, C8 source run: longest *completed* text call 16.9s,
+  # while three in-flight calls were truncated at 109s, 139s and 108s -- runaway
+  # generation, not a normal call caught at the window edge. Capping them at
+  # 4096 (as the VL roles and mini-swe's MINISWE_MAX_TOKENS do) would bound it,
+  # but it changes the recorded request shape and so invalidates every existing
+  # bundle. Deliberately deferred; see pin-cpu/autoresearchowl.md.
+
   # Workforce orchestrators
   coordinator:      { port: 8000, gpus: [0] }
   task:             { port: 8001, gpus: [1] }
@@ -26,8 +34,8 @@ roles:
   reasoning:        { port: 8005, gpus: [5] }
 
   # Toolkit-internal text sub-agents — share a primary text endpoint
-  browser_planning: { port: 8003, gpus: [3] }   # share with web
-  audio:            { port: 8004, gpus: [4] }   # share with document
+  browser_planning: { port: 8003, gpus: [3] }
+  audio:            { port: 8004, gpus: [4] }
 
   # Multimodal endpoint — image / video / browser_web all share one VL server
   # Browser observations should produce one compact JSON action. In the C8
