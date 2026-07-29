@@ -1,0 +1,44 @@
+name: gaia_workforce_owl-tp42split
+
+# 6 text GPU, TP4+TP2 partitioned by LATENCY CLASS, not by load volume. All heavy/long-prompt roles share the fused TP4 pool (max KV + max cross-role prefix reuse + biggest decode batch); the three small orchestrator roles get a dedicated TP2 pool so their ~1K-token calls never queue behind an 11K prefill. Motivated by owl-h4 (<2K band decode 62->43.7 tok/s) and owl-tp42 (warm2 p95 20s).
+
+token_limit: 120000
+
+roles:
+  coordinator:       { port: 8001, gpus: [4, 5] }
+  task:              { port: 8001, gpus: [4, 5] }
+  answerer:          { port: 8001, gpus: [4, 5] }
+  web:               { port: 8000, gpus: [0, 1, 2, 3] }
+  document:          { port: 8000, gpus: [0, 1, 2, 3] }
+  reasoning:         { port: 8000, gpus: [0, 1, 2, 3] }
+  browser_planning:  { port: 8000, gpus: [0, 1, 2, 3] }
+  audio:             { port: 8000, gpus: [0, 1, 2, 3] }
+
+  browser_web:
+    port: 8002
+    gpus: [6]
+    extra_config:
+      max_tokens: 4096
+  image:
+    port: 8002
+    gpus: [6]
+    extra_config:
+      max_tokens: 4096
+  video:
+    port: 8002
+    gpus: [6]
+    extra_config:
+      max_tokens: 4096
+
+whisper_gpu: 7
+
+launch:
+  start_cmd: "bash scripts/gaia/start_vllm.sh"
+  stop_cmd: |
+    for s in $(tmux ls 2>/dev/null | awk -F: '/^gaia-/ {print $1}'); do
+      tmux kill-session -t "$s" || true
+    done
+
+scrape:
+  gpu_interval_s: 1.0
+  engine_interval_s: 1.0
